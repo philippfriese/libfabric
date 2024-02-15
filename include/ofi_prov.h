@@ -248,6 +248,16 @@ HOOK_PROFILE_INI ;
 #  define HOOK_PROFILE_INIT NULL
 #endif
 
+#if (HAVE_MONITOR) && (HAVE_MONITOR_DL)
+#  define HOOK_MONITOR_INI FI_EXT_INI
+#  define HOOK_MONITOR_INIT NULL
+#elif (HAVE_MONITOR)
+#  define HOOK_MONITOR_INI INI_SIG(fi_hook_profile_ini)
+#  define HOOK_MONITOR_INIT fi_hook_profile_ini()
+HOOK_MONITOR_INI ;
+#else
+#  define HOOK_MONITOR_INIT NULL
+#endif
 
 #if (HAVE_HOOK_DEBUG) && (HAVE_HOOK_DEBUG_DL)
 #  define HOOK_DEBUG_INI FI_EXT_INI
