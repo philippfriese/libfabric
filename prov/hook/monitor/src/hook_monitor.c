@@ -37,6 +37,8 @@
 
 #include "hook_monitor.h"
 
+#include <stdio.h>
+
 static inline struct monitor_context *monitor_ctx(struct hook_ep *ep)
 {
 	return &container_of(ep->domain->fabric, struct monitor_fabric,
@@ -75,6 +77,26 @@ static inline int mon_size_bucket(size_t len)
 		return MON_SIZE_1M_4M;
 	else
 		return MON_SIZE_4M_UP;
+}
+
+static int mon_flush(struct monitor_context *ctx) {
+        // TODO: require msync here, otherwise read from flags might return stale values
+	uint8_t *flags = (uint8_t*)(ctx->share + ctx->share_size-sizeof(uint8_t));
+	bool request = *flags & 0b00000001;
+	bool buffer  = *flags & 0b00000010;
+	if (request) {
+		memcpy(ctx->share + (buffer == 0 ? 0 : sizeof(struct monitor_data) * mon_api_size), ctx->data, 
+			sizeof(struct monitor_data) * mon_api_size);
+		*flags ^= (0b00000011);
+
+		if (msync(ctx->share, ctx->share_size, MS_SYNC) != 0) {
+			FI_WARN(ctx->hprov, FI_LOG_CORE, "msync failed! %s\n", strerror(errno));
+		}	
+		ctx->last_sync = time(NULL);
+		return 1;
+	}
+
+	return 0;
 }
 
 static bool
@@ -156,6 +178,12 @@ mon_add_cntr(struct monitor_context *ctx, int cntr, int index, size_t size) {
 	ctx->data[cntr].count[index]++;
 	if (size != MON_IGNORE_SIZE) {
 		ctx->data[cntr].sum[index] += size;
+	}
+	ctx->tick++;
+	if (ctx->tick >= ctx->tick_max || time(NULL) - ctx->last_sync > 10) {
+		if (mon_flush(ctx)) {
+			ctx->tick = 0;
+		}
 	}
 }
 
@@ -822,12 +850,53 @@ static int monitor_domain_init(struct fid *fid)
 	return 0;
 }
 
+static int
+monitor_shm_init(struct monitor_context *mon_ctx)
+{
+	const struct fi_provider *hprov = mon_ctx->hprov;
+
+	int fd;
+	int pid = getpid();
+	sprintf(mon_ctx->path_data, "/tmp/pfriese/ofi_hook_monitor_%d_%s.data", pid, hprov->name);
+	mon_ctx->share_size = sizeof(struct monitor_data) * mon_api_size * 2 + sizeof(uint8_t);
+
+	FILE *file = fopen(mon_ctx->path_data, "wb");
+	fseek(file, mon_ctx->share_size-1, SEEK_SET);
+    fputc('\0', file);
+	fclose(file);
+
+	fd = open(mon_ctx->path_data, O_CREAT | O_RDWR | O_SYNC, S_IRUSR | S_IWUSR);
+	mon_ctx->share = mmap(0, mon_ctx->share_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	if (mon_ctx->share == MAP_FAILED) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to mmap!\n");
+	}
+	mon_ctx->share[mon_ctx->share_size-sizeof(uint8_t)] = 0b11010101;
+
+	close(fd);
+	return 0;
+}
+
+static int
+monitor_shm_close(struct monitor_context *mon_ctx)
+{
+	const struct fi_provider *hprov = mon_ctx->hprov;
+
+	if (munmap(mon_ctx->share, mon_ctx->share_size) != 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to munmap!");
+	};
+
+	unlink(mon_ctx->path_data);
+
+	return FI_SUCCESS;
+}
+
 static int hook_monitor_close(struct fid *fid)
 {
 	struct monitor_context *ctx = 
 		&(container_of(fid, struct monitor_fabric, fabric_hook)->mon_ctx);
 
 	mon_report(ctx->hprov, ctx->data);
+	monitor_shm_close(ctx);
 
 	hook_close(fid);
 	return FI_SUCCESS;
@@ -850,13 +919,25 @@ hook_monitor_fabric(struct fi_fabric_attr *attr,
 	struct fi_provider *hprov = context;
 	struct monitor_fabric *fab;
 
-	FI_TRACE(hprov, FI_LOG_FABRIC, "Installing profile hook\n");
+	FI_TRACE(hprov, FI_LOG_FABRIC, "Installing monitor hook\n");
 	fab = calloc(1, sizeof *fab);
 	if (!fab)
 		return -FI_ENOMEM;
 
 	fab->mon_ctx.hprov = hprov;
 	memset(&fab->mon_ctx.data, 0, sizeof (fab->mon_ctx.data));
+	size_t tick_max = TICK_MAX_DEFAULT;
+	const char* tick_max_s = getenv("FI_HOOK_MONITOR_TICK_MAX");
+	if (tick_max_s != NULL) {
+		FI_WARN(hprov, FI_LOG_FABRIC, " parsing FI_HOOK_MONITOR_TICK_MAX\n");
+		if (sscanf(tick_max_s, "%zu", &tick_max) != 1) {
+			FI_WARN(hprov, FI_LOG_FABRIC, " parsing FI_HOOK_MONITOR_TICK_MAX failed!\n");
+		}
+	}
+	fab->mon_ctx.tick_max = tick_max;
+	fab->mon_ctx.last_sync = 0; // deliberate!
+
+	monitor_shm_init(&fab->mon_ctx);
 	hook_fabric_init(&fab->fabric_hook, HOOK_MONITOR, attr->fabric, hprov,
 	                 &monitor_fabric_fid_ops, &hook_monitor_ctx);
 	*fabric = &fab->fabric_hook.fabric;

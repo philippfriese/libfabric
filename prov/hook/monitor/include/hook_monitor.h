@@ -37,6 +37,7 @@
 #include "ofi.h"
 
 #define MON_IGNORE_SIZE  0
+#define TICK_MAX_DEFAULT 1000
 
 #define MONITOR_APIS(DECL)  \
 	DECL(mon_recv),  \
@@ -121,6 +122,12 @@ struct monitor_data {
 struct monitor_context {
 	const struct fi_provider *hprov;
 	struct monitor_data data[mon_api_size];
+	size_t tick;
+	size_t tick_max;
+	time_t last_sync;
+	char* share;
+	size_t share_size;
+	char path_data[64];
 };
 
 struct monitor_fabric {

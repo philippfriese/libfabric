@@ -219,6 +219,8 @@ void mon_report(const struct fi_provider *prov,  struct monitor_data *data)
 	}
 
 	FI_TRACE(prov, FI_LOG_CORE, "  \tprov: %s\n", prov->name);
+	struct monitor_context *ctx = container_of(prov, struct monitor_context, hprov);
+	FI_TRACE(prov, FI_LOG_CORE, "  \tfi_provider: %p, monitor_context: %p\n", prov, ctx);
 
 	with_title = true;
 	mon_log_apis(prov, "XFER_API", "Size", "recv", 1,
