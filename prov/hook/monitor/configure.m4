@@ -17,6 +17,16 @@ AC_DEFUN([FI_MONITOR_CONFIGURE],[
             [AS_HELP_STRING([--with-curl=DIR], [Install directory for curl])],
             [])
 
+    hook_monitor_coll=0
+    AC_ARG_ENABLE([monitor-collectives],
+    [AS_HELP_STRING([--enable-monitor-collectives], [Enable monitoring of fi_collective operations @<:@default=no@:>@] )
+    ],
+    [
+           AS_IF([test "$enable_monitor_collectives" != "no"], [hook_monitor_coll=1])
+    ])
+    # define and set HOOK_MONITOR_COLL
+    AC_DEFINE_UNQUOTED([HOOK_MONITOR_COLL], [$hook_monitor_coll], [Enable monitoring of fi_collective operations])
+
     AS_IF([test x"$enable_monitor" != x"no"], [
             monitor_happy=1
             # Add on curl if installed in non-default location.

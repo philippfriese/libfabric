@@ -188,6 +188,12 @@ static const char *mon_functions_ep[] = {
 	"mon_read",         "mon_readv",        "mon_readmsg",
 	"mon_write",        "mon_writev",       "mon_writemsg",
 	"mon_inject_write", "mon_writedata",    "mon_inject_writedata",
+#if HOOK_MONITOR_COLL
+	"mon_barrier",	    "mon_broadcast",    "mon_alltoall",
+	"mon_allreduce",    "mon_allgather",    "mon_reduce_scatter",
+	"mon_reduce",       "mon_scatter",      "mon_gather",
+	"mon_msg",          "mon_barrier2",
+#endif
 };
 
 static const char *mon_functions_cq[] = {
