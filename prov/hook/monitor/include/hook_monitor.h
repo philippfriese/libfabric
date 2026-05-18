@@ -47,37 +47,6 @@
 
 #define MON_DESCRIPTOR_VERSION 0b1
 
-// Note: keep in-sync with util/mon_sampler.c
-#define MONITOR_APIS_EP(DECL)  \
-	DECL(mon_recv),  \
-	DECL(mon_recvv), \
-	DECL(mon_recvmsg), \
-	DECL(mon_trecv), \
-	DECL(mon_trecvv), \
-	DECL(mon_trecvmsg), \
-	DECL(mon_send), \
-	DECL(mon_sendv), \
-	DECL(mon_sendmsg), \
-	DECL(mon_inject),  \
-	DECL(mon_senddata),  \
-	DECL(mon_injectdata),  \
-	DECL(mon_tsend),  \
-	DECL(mon_tsendv),  \
-	DECL(mon_tsendmsg),  \
-	DECL(mon_tinject),	 \
-	DECL(mon_tsenddata),  \
-	DECL(mon_tinjectdata),  \
-	DECL(mon_read),  \
-	DECL(mon_readv),  \
-	DECL(mon_readmsg),  \
-	DECL(mon_write),  \
-	DECL(mon_writev),  \
-	DECL(mon_writemsg),  \
-	DECL(mon_inject_write),  \
-	DECL(mon_writedata),  \
-	DECL(mon_inject_writedata), \
-	DECL(mon_api_ep_size)
-
 #define MONITOR_APIS_CQ(DECL)  \
 	DECL(mon_cq_read),  \
 	DECL(mon_cq_readfrom),	 \
@@ -99,8 +68,49 @@
 	DECL(mon_mr_regattr),  \
 	DECL(mon_api_dom_size)
 
+// Note: keep in-sync with util/mon_sampler.c
 enum mon_api_ep_counters {
-	MONITOR_APIS_EP(OFI_ENUM_VAL)
+	mon_recv,
+	mon_recvv,
+	mon_recvmsg,
+	mon_trecv,
+	mon_trecvv,
+	mon_trecvmsg,
+	mon_send,
+	mon_sendv,
+	mon_sendmsg,
+	mon_inject,
+	mon_senddata,
+	mon_injectdata,
+	mon_tsend,
+	mon_tsendv,
+	mon_tsendmsg,
+	mon_tinject,
+	mon_tsenddata,
+	mon_tinjectdata,
+	mon_read,
+	mon_readv,
+	mon_readmsg,
+	mon_write,
+	mon_writev,
+	mon_writemsg,
+	mon_inject_write,
+	mon_writedata,
+	mon_inject_writedata,
+#if HOOK_MONITOR_COLL
+	mon_barrier,
+	mon_broadcast,
+	mon_alltoall,
+	mon_allreduce,
+	mon_allgather,
+	mon_reduce_scatter,
+	mon_reduce,
+	mon_scatter,
+	mon_gather,
+	mon_msg,
+	mon_barrier2,
+#endif
+	mon_api_ep_size
 };
 enum mon_api_cq_counters {
 	MONITOR_APIS_CQ(OFI_ENUM_VAL)

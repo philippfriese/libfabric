@@ -1065,6 +1065,206 @@ struct fi_ops_cq monitor_cq_ops = {
 	.strerror = hook_cq_strerror,
 };
 
+
+#if HOOK_MONITOR_COLL
+static ssize_t
+monitor_barrier(struct fid_ep *ep, fi_addr_t coll_addr, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_barrier(myep->hep, coll_addr, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_barrier, 0, MON_IGNORE_SIZE);
+	return ret;
+}
+
+static ssize_t
+monitor_broadcast(struct fid_ep *ep,
+		void *buf, size_t count, void *desc,
+		fi_addr_t coll_addr, fi_addr_t root_addr,
+		enum fi_datatype datatype, uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_broadcast(myep->hep, buf, count, desc, coll_addr, root_addr,
+		datatype, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_broadcast,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_alltoall(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc, fi_addr_t coll_addr,
+		enum fi_datatype datatype, uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_alltoall(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, datatype, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_alltoall,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_allreduce(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc, fi_addr_t coll_addr,
+		enum fi_datatype datatype, enum fi_op op,
+		uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_allreduce(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, datatype, op, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_allreduce,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_allgather(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc, fi_addr_t coll_addr,
+		enum fi_datatype datatype, uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_allgather(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, datatype, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_allgather,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_reduce_scatter(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc, fi_addr_t coll_addr,
+		enum fi_datatype datatype, enum fi_op op,
+		uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_reduce_scatter(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, datatype, op, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_reduce_scatter,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_reduce(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc, fi_addr_t coll_addr,
+		fi_addr_t root_addr, enum fi_datatype datatype, enum fi_op op,
+		uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_reduce(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, root_addr, datatype, op, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_reduce,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_scatter(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc,
+		fi_addr_t coll_addr, fi_addr_t root_addr,
+		enum fi_datatype datatype, uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_scatter(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, root_addr, datatype, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_scatter,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_gather(struct fid_ep *ep,
+		const void *buf, size_t count, void *desc,
+		void *result, void *result_desc,
+		fi_addr_t coll_addr, fi_addr_t root_addr,
+		enum fi_datatype datatype, uint64_t flags, void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_gather(myep->hep, buf, count, desc, result, result_desc,
+		coll_addr, root_addr, datatype, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_gather,
+			mon_size_bucket(count * ofi_datatype_size(datatype)),
+			count);
+	return ret;
+}
+
+static ssize_t
+monitor_msg(struct fid_ep *ep,
+		const struct fi_msg_collective *msg,
+		struct fi_ioc *resultv, void **result_desc,
+		size_t result_count, uint64_t flags) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	// FIXME: find proper function
+	ret = fi_coll_no_msg(myep->hep, msg, resultv, result_desc, result_count, flags);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_msg,
+			0, MON_IGNORE_SIZE);
+	return ret;
+}
+
+static ssize_t
+monitor_barrier2(struct fid_ep *ep, fi_addr_t coll_addr, uint64_t flags,
+			void *context) {
+	struct hook_ep *myep = container_of(ep, struct hook_ep, ep);
+	ssize_t ret;
+
+	ret = fi_barrier2(myep->hep,coll_addr, flags, context);
+	if (!ret)
+		mon_add_cntr(monitor_ctx(myep), mon_barrier2, 0,
+			MON_IGNORE_SIZE);
+	return ret;
+}
+
+struct fi_ops_collective monitor_collective_ops = {
+	.size = sizeof(struct fi_ops_collective),
+	.barrier = monitor_barrier,
+	.broadcast = monitor_broadcast,
+	.alltoall = monitor_alltoall,
+	.allreduce = monitor_allreduce,
+	.allgather = monitor_allgather,
+	.reduce_scatter = monitor_reduce_scatter,
+	.reduce = monitor_reduce,
+	.scatter = monitor_scatter,
+	.gather = monitor_gather,
+	.msg = monitor_msg,
+	.barrier2 = monitor_barrier2,
+};
+
+#endif //HOOK_MONITOR_COLL
+
 static int
 monitor_mr_reg(struct fid *fid, const void *buf, size_t len,
                uint64_t access, uint64_t offset, uint64_t requested_key,
@@ -1264,7 +1464,9 @@ static int monitor_ep_init(struct fid *fid)
 	ep->msg = &monitor_msg_ops;
 	ep->rma = &monitor_rma_ops;
 	ep->tagged = &monitor_tagged_ops;
-
+#if HOOK_MONITOR_COLL
+	ep->collective = &monitor_collective_ops;
+#endif
 	return 0;
 }
 
