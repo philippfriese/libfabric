@@ -258,60 +258,90 @@ int ms_create_file_entry(struct ct_mon_sampler *ct, struct file_entry *file) {
 	return 0;
 }
 
-int ms_update_file_entries(struct ct_mon_sampler *ct) {
+static int ms_update_file_entries_dir(struct ct_mon_sampler *ct, char* path) {
+	struct dirent *dir_entry;
+	DIR *dr;
+	char subdir[PATH_MAX];
 	int ret = 0;
-	struct dlist_entry *entry, *tmp;
-	struct file_entry *fentry;
 
-	if (S_ISREG(ct->target_mode)) { // regular file
-		if (dlist_empty(&ct->files)) {
+	dr = opendir(path);
+	if (dr == NULL) {
+		if (errno == EACCES) {
+			fprintf(stderr, "Could not access directory %s, will skip.\n", path);
+			return 0;
+		}
+
+		goto error;
+	}
+
+	while ((dir_entry = readdir(dr)) != NULL) {
+		if (dir_entry->d_type == DT_DIR && 
+			strcmp(dir_entry->d_name, ".") != 0 && 
+			strcmp(dir_entry->d_name, "..") != 0 ) {
+			if (snprintf(subdir, PATH_MAX, "%s/%s", 
+				path, dir_entry->d_name) < 0) {
+				errno = EINVAL;
+				goto error;
+			}
+
+			ret = ms_update_file_entries_dir(ct, subdir);
+			if (ret != 0)
+				goto error;
+		}
+		if (dir_entry->d_type != DT_REG)
+			continue;
+
+		char in_path[PATH_MAX];
+		if (snprintf(in_path, PATH_MAX, "%s/%s", 
+			     path, dir_entry->d_name) < 0) {
+			errno = EINVAL;
+			goto error;
+		}
+		if (dlist_find_first_match(&ct->files, file_entry_match, in_path) == NULL) {
 			struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
 			if (fentry == NULL) {
-				return -ENOMEM;
+				errno = ENOMEM;
+				goto error;
 			}
-			strncpy(fentry->in_path, ct->opts.target_path, PATH_MAX-1);
-			ret = ms_create_file_entry(ct, fentry);
-			if (ret != 0)
-				return ret;
+			strncpy(fentry->in_path, in_path, PATH_MAX);
+			int ret = ms_create_file_entry(ct, fentry);
+			if (ret != 0) {
+				errno = ret;
+				goto error;
+			}
 			dlist_insert_after(&fentry->list_entry, &ct->files);
 		}
 	}
-	else if (S_ISDIR(ct->target_mode)) { // directory
-		struct dirent *dir_entry;
-		DIR *dr;
-		if ((dr = opendir(ct->opts.target_path)) == NULL) {
-			fprintf(stderr, "Could not open directory %s: %s\n",
-			       ct->opts.target_path, strerror(errno));
-			return -EEXIST;
-		}
-		while ((dir_entry = readdir(dr)) != NULL) {
-			if (dir_entry->d_type != DT_REG)
-				continue;
+	closedir(dr);
 
-			char in_path[PATH_MAX];
-			if (snprintf(in_path, PATH_MAX, "%s/%s",
-				     ct->opts.target_path, dir_entry->d_name) < 0) {
-				fprintf(stderr, "Could not format in_path for file %s\n",
-				       dir_entry->d_name);
-				closedir(dr);
-				return -EINVAL;
-			}
-			if (dlist_find_first_match(&ct->files, file_entry_match, in_path) == NULL) {
-				struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
-				if (fentry == NULL) {
-					closedir(dr);
-					return -ENOMEM;
-				}
-				strncpy(fentry->in_path, in_path, PATH_MAX);
-				int ret = ms_create_file_entry(ct, fentry);
-				if (ret != 0) {
-					closedir(dr);
-					return ret;
-				}
-				dlist_insert_after(&fentry->list_entry, &ct->files);
-			}
+	return 0;
+error:
+	fprintf(stderr, "Could not handle directory %s: %s\n", path, strerror(errno));
+	closedir(dr);
+	return -errno;
+}
+
+// open new target file(s) and close deleted files
+static int ms_update_file_entries(struct ct_mon_sampler *ct) {
+	int ret;
+	struct dlist_entry *entry, *tmp;
+	struct file_entry *fentry;
+
+	if (S_ISREG(ct->target_mode) && dlist_empty(&ct->files)) {
+		struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
+		if (fentry == NULL) {
+			return -ENOMEM;
 		}
-		closedir(dr);
+		strncpy(fentry->in_path, ct->opts.target_path, PATH_MAX-1);
+		ret = ms_create_file_entry(ct, fentry);
+		if (ret != 0)
+			return ret;
+		dlist_insert_after(&fentry->list_entry, &ct->files);
+	}
+	else if (S_ISDIR(ct->target_mode)) {
+		ret = ms_update_file_entries_dir(ct, ct->opts.target_path);
+		if (ret != 0)
+			return ret;
 	}
 
 	// check whether any files have to be deleted
