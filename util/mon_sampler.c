@@ -44,6 +44,7 @@
 #include <sys/wait.h>
 
 #include <ofi_mem.h>
+#include <ofi_list.h>
 #include <rdma/fi_errno.h>
 
 #include <sys/stat.h>
@@ -77,7 +78,7 @@ struct file_entry {
 	char in_path[PATH_MAX];
 	char out_path[PATH_MAX];
 	struct monitor_mapped_data* share;
-	struct file_entry *next;
+	struct dlist_entry list_entry;
 	FILE *output;
 	bool is_mapped;
 	bool finalize;
@@ -88,7 +89,7 @@ struct ct_mon_sampler {
 	struct ms_opts opts;
 	struct monitor_data data[mon_api_size];
 	mode_t target_mode;
-	struct file_entry *files;
+	struct dlist_entry files;
 };
 
 // Note: keep in-sync with prov/hook/monitor/include/hook_monitor.h
@@ -113,15 +114,6 @@ static const char* mon_buckets[] = {
 	"0_64",	    "64_512",  "512_1K", "1K_4K", "4K_64K",
 	"64K_256K", "256K_1M", "1M_4M",	 "4M_UP",
 };
-
-bool file_exists(struct file_entry *file_ptr, char *in_path) {
-	while (file_ptr != NULL) {
-		if (strncmp(in_path, file_ptr->in_path, PATH_MAX) == 0)
-			return true;
-		file_ptr = file_ptr->next;
-	}
-	return false;
-}
 
 /*******************************************************************************
  *                         Output Functions
@@ -173,51 +165,39 @@ static void ms_output_data(struct ct_mon_sampler *ct,
  *                         Resource Management Functions
  ******************************************************************************/
 
-int ms_free_file_entry(struct file_entry *file) {
+static int file_entry_match(struct dlist_entry *entry, const void *arg) {
+	struct file_entry *entry_ptr;
+	entry_ptr = container_of(entry, struct file_entry, list_entry);
+	return (strncmp(arg, entry_ptr->in_path, PATH_MAX) == 0);
+}
+
+static int ms_remove_file_entry(struct ct_mon_sampler *ct, struct dlist_entry *entry) {
+	int fn = 0;
+	struct file_entry *file;
+	file = container_of(entry, struct file_entry, list_entry);
+
 	if (file->output != NULL && file->output != stdout) {
-		fsync(fileno(file->output));
-		fclose(file->output);
+		fn = fileno(file->output);
+		if (fn == -1) goto error;
+		if (fsync(fn) == -1) goto error;
+		if (fclose(file->output) == -1) goto error;
 	}
 	if (file->is_mapped)
-		munmap(file->share, sizeof(struct monitor_mapped_data));
+		if (munmap(file->share, sizeof(struct monitor_mapped_data)) == -1) 
+			goto error;
 	if (file->finalize)
-		remove(file->in_path);
-	fprintf(stderr, "Closed %s\n", file->in_path);
+		if (remove(file->in_path) == -1) 
+			goto error;
+
+	dlist_remove(entry);
+	free(file);
 	return 0;
-}
-
-// linked list helper functions
-void ms_add_file_entry(struct ct_mon_sampler *ct, struct file_entry *entry) {
-	if (ct->files == NULL)
-		ct->files = entry;
-	else {
-		struct file_entry *file_ptr = ct->files;
-		while (file_ptr->next != NULL)
-			file_ptr = file_ptr->next;
-		file_ptr->next = entry;
-	}
-}
-
-struct file_entry* ms_remove_file_entry(struct ct_mon_sampler *ct,
-					struct file_entry *entry) {
-	if (ct->files == entry) {
-		ct->files = ct->files->next;
-		ms_free_file_entry(entry);
-		free(entry);
-		return ct->files;
-	}
-
-	struct file_entry *file_ptr = ct->files;
-	while (file_ptr != NULL) {
-		if (file_ptr->next == entry) {
-			file_ptr = file_ptr->next->next;
-			break;
-		}
-		file_ptr = file_ptr->next;
-	}
-	ms_free_file_entry(entry);
-	free(entry);
-	return file_ptr;
+error:
+	fprintf(stderr, "Error removing %s: %s\n", 
+		file->in_path, strerror(errno));
+	dlist_remove(entry);
+	free(file);
+	return -1;
 }
 
 // file entry management functions
@@ -279,19 +259,21 @@ int ms_create_file_entry(struct ct_mon_sampler *ct, struct file_entry *file) {
 }
 
 int ms_update_file_entries(struct ct_mon_sampler *ct) {
-	if (S_ISREG(ct->target_mode)) { // regular file
-		if (ct->files == NULL) {
-			struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
-			strncpy(fentry->in_path, ct->opts.target_path, PATH_MAX-1);
+	int ret = 0;
+	struct dlist_entry *entry, *tmp;
+	struct file_entry *fentry;
 
-			// for single-file sampling, print to stdout unless specified otherwise
-			if (ct->opts.output == NULL)
-				fentry->output = stdout;
-			int ret = ms_create_file_entry(ct, fentry);
+	if (S_ISREG(ct->target_mode)) { // regular file
+		if (dlist_empty(&ct->files)) {
+			struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
+			if (fentry == NULL) {
+				return -ENOMEM;
+			}
+			strncpy(fentry->in_path, ct->opts.target_path, PATH_MAX-1);
+			ret = ms_create_file_entry(ct, fentry);
 			if (ret != 0)
 				return ret;
-
-			ms_add_file_entry(ct, fentry);
+			dlist_insert_after(&fentry->list_entry, &ct->files);
 		}
 	}
 	else if (S_ISDIR(ct->target_mode)) { // directory
@@ -314,7 +296,7 @@ int ms_update_file_entries(struct ct_mon_sampler *ct) {
 				closedir(dr);
 				return -EINVAL;
 			}
-			if (!file_exists(ct->files, in_path)) {
+			if (dlist_find_first_match(&ct->files, file_entry_match, in_path) == NULL) {
 				struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
 				if (fentry == NULL) {
 					closedir(dr);
@@ -326,40 +308,35 @@ int ms_update_file_entries(struct ct_mon_sampler *ct) {
 					closedir(dr);
 					return ret;
 				}
-				ms_add_file_entry(ct, fentry);
+				dlist_insert_after(&fentry->list_entry, &ct->files);
 			}
 		}
 		closedir(dr);
 	}
 
 	// check whether any files have to be deleted
-	struct file_entry *file_ptr = ct->files;
-	while (file_ptr != NULL) {
-		if (file_ptr->finalize) {
-			file_ptr = ms_remove_file_entry(ct, file_ptr);
+	dlist_foreach_safe(&ct->files, entry, tmp) {
+		fentry = container_of(entry, struct file_entry, list_entry);
+		if (fentry->finalize) {
+			ms_remove_file_entry(ct, entry);
 			continue;
 		}
 		struct stat st;
-		if (stat(file_ptr->in_path, &st) == -1) {
-			file_ptr = ms_remove_file_entry(ct, file_ptr);
+		if (stat(fentry->in_path, &st) == -1) {
+			ms_remove_file_entry(ct, entry);
 			continue;
 		}
-		file_ptr = file_ptr->next;
 	}
 
 	return 0;
 }
 
 static void ms_cleanup(struct ct_mon_sampler *ct) {
-	// free all file_entry entries
-	struct file_entry *file_ptr = ct->files;
-	while (file_ptr != NULL) {
-		struct file_entry *del_ptr = file_ptr;
-		ms_free_file_entry(del_ptr);
-		file_ptr = file_ptr->next;
-		free(del_ptr);
-	}
-	ct->files = NULL;
+	struct dlist_entry *entry, *tmp;
+
+	if (ct->files.next != NULL)
+		dlist_foreach_safe(&ct->files, entry, tmp)
+			ms_remove_file_entry(ct, entry);
 }
 
 /*******************************************************************************
@@ -387,14 +364,16 @@ static int ms_extract_data(struct ct_mon_sampler *ct, struct file_entry *entry) 
  ******************************************************************************/
 
 int ms_run(struct ct_mon_sampler *ct) {
+	struct file_entry *file_ptr;
+	struct dlist_entry *entry, *tmp;
 	int ret = ms_update_file_entries(ct);
 	if (ret) {
 		running = 0;
 		return ret;
 	}
 
-	struct file_entry *file_ptr = ct->files;
-	while (file_ptr != NULL) {
+	dlist_foreach_safe(&ct->files, entry, tmp) {
+		file_ptr = container_of(entry, struct file_entry, list_entry);
 		ret = ms_extract_data(ct, file_ptr);
 
 		switch (ret) {
@@ -405,7 +384,8 @@ int ms_run(struct ct_mon_sampler *ct) {
 		default:
 			break;
 		}
-		file_ptr = file_ptr->next;
+		if (file_ptr->finalize)
+			ms_remove_file_entry(ct, entry);
 	}
 
 	return 0;
@@ -500,6 +480,7 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Target is a directory, cannot use stdout as output!\n");
 		return -ENOENT;
 	}
+	dlist_init(&ct.files);
 
 
 	signal(SIGINT, signal_handler);
