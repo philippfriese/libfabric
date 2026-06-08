@@ -18,9 +18,14 @@ fi_mon_sampler  \- Simple sampler for ofi_hook_monitor provider.
 
 # DESCRIPTION
 
-Extract data from the ofi_hook_monitor provider via communication files. `<target>` can either be
-one communication file or a folder of files. Data is exported based on `-f <format>` and either printed
-to stdout (only for single files), or stored per communication file at `-o <outpath>`.
+Extract monitoring data from communication files of the ofi_hook_monitor 
+provider at `<target>` location.
+
+`<target>` can either a single communication file or a directory. If a directory
+is provided, then this directory is recursively scanned for communication files.
+
+Data is exported based on `-f <format>` and either printed to stdout 
+(only for single files), or stored per communication file at `-o <outpath>`.
 The sampler can watch the communication files for changes via the option `-w <msec>` 
 for repeated sampling.
 
