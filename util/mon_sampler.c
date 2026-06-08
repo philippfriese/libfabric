@@ -49,6 +49,11 @@
 
 #include <sys/stat.h>
 
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <sys/inotify.h>
+#endif
+
 #ifdef __APPLE__
 #include <sys/mman.h>
 #endif
@@ -56,6 +61,10 @@
 #include <libgen.h>
 #include <dirent.h>
 #include <prov/hook/monitor/include/hook_monitor.h>
+
+#define INOFITY_ELEM_PER_BUF 32
+#define INOFITY_BUF_SIZE (INOFITY_ELEM_PER_BUF*(sizeof(struct inotify_event) + NAME_MAX + 1))
+
 
 static volatile sig_atomic_t running = 0;
 
@@ -85,11 +94,26 @@ struct file_entry {
 	bool header_written;
 };
 
+#ifdef __linux__
+struct inotify_entry {
+	struct dlist_entry list_entry;
+	int wd;
+	char path[PATH_MAX];
+};
+#endif
+
 struct ct_mon_sampler {
 	struct ms_opts opts;
 	struct monitor_data data[mon_api_size];
 	mode_t target_mode;
 	struct dlist_entry files;
+
+	/* inotify components */
+#ifdef __linux__
+	int inotify_fd;
+	char inotify_buffer[INOFITY_BUF_SIZE] __attribute__((aligned(__alignof__(struct inotify_event))));
+	struct dlist_entry inotifies;
+#endif
 };
 
 // Note: keep in-sync with prov/hook/monitor/include/hook_monitor.h
@@ -364,10 +388,189 @@ static int ms_update_file_entries(struct ct_mon_sampler *ct) {
 static void ms_cleanup(struct ct_mon_sampler *ct) {
 	struct dlist_entry *entry, *tmp;
 
+#ifdef __linux__
+	struct inotify_entry *inotify_ptr;
+	if (ct->inotifies.next != NULL) {
+		dlist_foreach_safe(&ct->inotifies, entry, tmp) {
+			inotify_ptr = container_of(entry, struct inotify_entry, list_entry);
+			dlist_remove(entry);
+			free(inotify_ptr);
+		} 
+	}
+	if(close(ct->inotify_fd) == -1)
+		goto error;
+#endif
+
 	if (ct->files.next != NULL)
 		dlist_foreach_safe(&ct->files, entry, tmp)
 			ms_remove_file_entry(ct, entry);
+	return;
+error:
+	fprintf(stderr, "Error cleaning up: %u (%s)\n",
+		errno, strerror(errno));
 }
+
+/*******************************************************************************
+ *                         inotify functions
+ ******************************************************************************/
+
+#ifdef __linux__
+static int inotify_entry_match(struct dlist_entry *entry, const void *arg) {
+	struct inotify_entry *entry_ptr;
+	entry_ptr = container_of(entry, struct inotify_entry, list_entry);
+	return (*(int *)arg == entry_ptr->wd);
+}
+
+static int ms_add_inotify_dir(struct ct_mon_sampler *ct, char* path) {
+	struct dirent *dir_entry;
+	DIR *dr;
+	char subdir[PATH_MAX];
+	struct inotify_entry *ientry;
+
+	ientry = calloc(1, sizeof(struct inotify_entry)); 
+	if (ientry == NULL) {
+		fprintf(stderr, "Could not allocate memory\n");
+		return -ENOMEM;
+	}
+	strncpy(ientry->path, path, PATH_MAX-1);
+	ientry->wd = inotify_add_watch(ct->inotify_fd, path, 
+		IN_CREATE|IN_DELETE|IN_DELETE_SELF|IN_ONLYDIR|IN_EXCL_UNLINK);
+	if (ientry->wd == -1) {
+		fprintf(stderr, "Could not create inotify watch at %s: %s\n",
+			path, strerror(errno));
+		return -errno;
+	}
+
+	dlist_insert_after(&ientry->list_entry, &ct->inotifies);
+
+	dr = opendir(path);
+	if (dr == NULL) {
+		fprintf(stderr, "Error opening directory %s: %s\n", 
+			path, strerror(errno));
+		goto error_cleanup;
+	}
+
+	while ((dir_entry = readdir(dr)) != NULL) {
+		if (dir_entry->d_type == DT_DIR && 
+			strcmp(dir_entry->d_name, ".") != 0 && 
+			strcmp(dir_entry->d_name, "..") != 0 ) {
+			if (snprintf(subdir, PATH_MAX, "%s/%s", 
+				path, dir_entry->d_name) < 0) {
+				fprintf(stderr, "Error formatting path components %s, %s\n",
+					path, dir_entry->d_name);
+				goto error_cleanup;
+			}
+			ms_add_inotify_dir(ct, subdir);
+		} 
+	}
+	closedir(dr);
+
+	return 0;
+error_cleanup:
+	closedir(dr);
+	return -errno;
+}
+
+static int ms_handle_inotify_event(struct ct_mon_sampler *ct, 
+	struct inotify_event *event) {
+	int ret = 0;
+	char f_path[PATH_MAX];
+	struct stat st;
+
+	struct inotify_entry *ientry_ptr;
+	struct dlist_entry *i_entry, *f_entry;
+
+	if (event->mask & IN_IGNORED)
+		return 0;
+
+	i_entry = dlist_find_first_match(&ct->inotifies, inotify_entry_match, 
+		&event->wd);
+	if (i_entry == NULL) {
+		fprintf(stderr, "Could not find inotify '%s'\n",
+			event->name);
+		return -EINVAL;
+	}
+	ientry_ptr = container_of(i_entry, struct inotify_entry, list_entry);
+	if (snprintf(f_path, PATH_MAX, "%s/%s",
+		ientry_ptr->path, event->name) < 0) {
+		fprintf(stderr, "Could not format f_path for file %s\n",
+				event->name);
+		return -EINVAL;
+	}
+	f_entry = dlist_find_first_match(&ct->files, file_entry_match, f_path);
+
+	if (event->mask & IN_CREATE) {
+		if (stat(f_path, &st) == -1) {
+			fprintf(stderr, "Could not stat %s: %s\n",
+				f_path, strerror(errno));
+			return -errno;
+		}
+		if (S_ISDIR(st.st_mode)) {
+			ret = ms_add_inotify_dir(ct, f_path);
+			if (ret != 0) {
+				fprintf(stderr, "Error adding inotify to dir %s: %s\n",
+					f_path, strerror(ret));
+				return ret;
+			}
+			ret = ms_update_file_entries_dir(ct, f_path);
+			if (ret != 0) {
+				fprintf(stderr, "Error updating directory %s: %s",
+					f_path, strerror(ret));
+				return ret;
+			}
+		}
+		else if (S_ISREG(st.st_mode) && f_entry == NULL) {
+			struct file_entry *fentry = calloc(1, sizeof(struct file_entry));
+			if (fentry == NULL)
+				return -ENOMEM;
+			strncpy(fentry->in_path, f_path, PATH_MAX);
+			ret = ms_create_file_entry(ct, fentry);
+			if (ret != 0)
+				return ret;
+			dlist_insert_after(&fentry->list_entry, &ct->files);
+		}
+	}
+	else if (event->mask & IN_DELETE && f_entry != NULL)
+		ms_remove_file_entry(ct, f_entry);
+	else if (event->mask & IN_DELETE_SELF) {
+		dlist_remove(&ientry_ptr->list_entry);
+		free(ientry_ptr);
+	}
+	return ret;
+}
+
+static int ms_check_inotify_events(struct ct_mon_sampler *ct) {
+	ssize_t available_bytes = 0;
+	ssize_t handled_bytes = 0;
+	size_t offset = 0;
+	struct inotify_event *event;
+	ssize_t read_bytes;
+
+	if (ioctl(ct->inotify_fd, FIONREAD, &available_bytes) == -1) {
+		fprintf(stderr, "Error in ioctl on inotify fd: %u (%s)\n",
+		errno, strerror(errno));
+		return errno;
+	}
+
+	while (handled_bytes < available_bytes) {
+		read_bytes = read(ct->inotify_fd, ct->inotify_buffer, INOFITY_BUF_SIZE);
+		if (read_bytes == -1) {
+			fprintf(stderr, "Error reading from inotify_fd: %u (%s)\n",
+				errno, strerror(errno));
+			return errno;
+		}
+
+		offset = 0;
+		while (offset < read_bytes) {
+  			event = (struct inotify_event*)(ct->inotify_buffer + offset);
+			ms_handle_inotify_event(ct, event);
+			offset += sizeof(struct inotify_event) + event->len;
+		}
+		handled_bytes += read_bytes;
+	}
+	return 0;
+}
+#endif
 
 /*******************************************************************************
  *                         Data Extraction Function
@@ -396,7 +599,14 @@ static int ms_extract_data(struct ct_mon_sampler *ct, struct file_entry *entry) 
 int ms_run(struct ct_mon_sampler *ct) {
 	struct file_entry *file_ptr;
 	struct dlist_entry *entry, *tmp;
-	int ret = ms_update_file_entries(ct);
+	int ret;
+
+#ifdef __linux__
+	ret = ms_check_inotify_events(ct);
+#else
+	ret = ms_update_file_entries(ct);
+#endif
+
 	if (ret) {
 		running = 0;
 		return ret;
@@ -424,6 +634,36 @@ int ms_run(struct ct_mon_sampler *ct) {
 /*******************************************************************************
 *                         CLI: Usage and Options parsing
  ******************************************************************************/
+
+static int ms_init_sampler(struct ct_mon_sampler *ct) {
+	int ret = 0;
+	struct stat st;
+
+	if (stat(ct->opts.target_path, &st) != 0) {
+		fprintf(stderr, "Could not stat %s: %s\n",
+			ct->opts.target_path, strerror(errno));
+		return errno;
+	}
+	
+	ct->target_mode = st.st_mode;
+	if (S_ISDIR(ct->target_mode) && ct->opts.output == NULL) {
+		fprintf(stderr, "Target is a directory, cannot use stdout as output!\n");
+		return -ENOENT;
+	}
+	dlist_init(&ct->files);
+
+#ifdef __linux__
+	dlist_init(&ct->inotifies);
+	ct->inotify_fd = inotify_init();
+	if (ct->inotify_fd == -1) 
+		return errno;
+	ms_add_inotify_dir(ct, ct->opts.target_path);
+
+	// inotify does not report on existing files; initialize file list manually 
+	ret = ms_update_file_entries(ct);
+#endif
+	return ret;
+}
 
 static void ms_usage(char *name) {
 	fprintf(stderr, "Sampler for ofi_hook_monitor provider\n\n");
@@ -498,21 +738,9 @@ int main(int argc, char **argv) {
 		ms_usage(argv[0]);
 		return 0;
 	}
-
-	struct stat st;
-	if (stat(argv[optind], &st) != 0) {
-		fprintf(stderr, "Could not stat %s\n", argv[optind]);
-		return -ENOENT;
-	}
 	ct.opts.target_path = argv[optind];
-	ct.target_mode = st.st_mode;
-	if (S_ISDIR(ct.target_mode) && ct.opts.output == NULL) {
-		fprintf(stderr, "Target is a directory, cannot use stdout as output!\n");
-		return -ENOENT;
-	}
-	dlist_init(&ct.files);
-
-
+	ret = ms_init_sampler(&ct);
+	
 	signal(SIGINT, signal_handler);
 	running = ct.opts.watch_usec > 0;
 
