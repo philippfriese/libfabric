@@ -61,22 +61,212 @@ struct monitor_environment mon_env = {
 	.basepath = MON_BASEPATH_DEFAULT,
 };
 
+static int
+monitor_context_init(const struct fi_provider *hprov,
+	struct monitor_context *mon_ctx)
+{
+	mode_t old_umask;
+	char outpath[PATH_MAX];
+	char hostname[PATH_MAX];
+	char buffer[PATH_MAX];
+	struct statfs info;
+	bool is_tmpfs;
+	unsigned long job_id;
+	const char* slurm_job_id_str;
+	unsigned int slurm_job_id;
+	char *endptr;
+	int fd;
+
+	errno = 0;
+	old_umask = umask(0);
+	if (mkdir(mon_env.basepath, 01777) != 0) {
+		if (errno != EEXIST) {
+			FI_WARN(hprov, FI_LOG_FABRIC,
+				"Could not create folder at %s: %s\n",
+				mon_env.basepath, strerror(errno));
+			umask(old_umask);
+			return -errno;
+		}
+	}
+	umask(old_umask);
+
+	// append UID to path, try to mkdir
+	if (snprintf(outpath, PATH_MAX, "%s/%u", mon_env.basepath, getuid()) < 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to format hook storage path!\n");
+		return -EOVERFLOW;
+	}
+	if (mkdir(outpath, mon_env.dir_mode) != 0) {
+		if (errno != EEXIST) {
+			FI_WARN(hprov, FI_LOG_FABRIC,
+				"Could not create folder at %s: %s\n",
+				outpath, strerror(errno));
+			return -errno;
+		}
+	}
+
+	// append hostname to path, try to mkdir
+	//  useful for containers which usually set hostname to the container name
+	if (gethostname(hostname, PATH_MAX) != 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to call gethostname (%s)!\n",
+			strerror(errno));
+		return -errno;
+	}
+	if (snprintf(buffer, PATH_MAX, "%s/%s", outpath, hostname) < 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to format outpath!\n");
+		return -EOVERFLOW;
+	}
+	strncpy(outpath, buffer, PATH_MAX);
+	errno = 0;
+	if (mkdir(outpath, mon_env.dir_mode) != 0) {
+		if (errno != EEXIST) {
+			FI_WARN(hprov, FI_LOG_FABRIC,
+				"Could not create folder at %s: %s\n",
+				outpath, strerror(errno));
+			return -errno;
+		}
+	}
+	statfs(outpath, &info);
+#ifdef __APPLE__
+	is_tmpfs = strncmp(info.f_fstypename, "tmpfs", 5) == 0;
+#else
+	is_tmpfs = info.f_type == TMPFS_MAGIC;
+#endif
+	if (!is_tmpfs) {
+		FI_WARN(hprov, FI_LOG_FABRIC,
+			"Communication file not on tmpfs! (%s) Proceed with caution.\n",
+			outpath);
+	}
+
+	job_id = 0;
+	slurm_job_id_str = getenv("SLURM_JOB_ID");
+	if (slurm_job_id_str != NULL) {
+		errno = 0;
+		slurm_job_id = strtoul(slurm_job_id_str, &endptr, 0);
+		if (errno == ERANGE || *endptr != '\0' || slurm_job_id_str == endptr)
+			FI_WARN(hprov, FI_LOG_FABRIC,
+				"Could not parse SLURM_JOB_ID!\n");
+		else
+			job_id = slurm_job_id;
+	}
+
+	char ctx_type[4];
+	switch (mon_ctx->context_type) {
+	case MON_CTX_TYPE_EP:
+		snprintf(ctx_type, 4, "ep"); break;
+	case MON_CTX_TYPE_CQ:
+		snprintf(ctx_type, 4, "cq"); break;
+	case MON_CTX_TYPE_DOM:
+		snprintf(ctx_type, 4, "dom"); break;
+	default: break;
+	}
+
+	if (snprintf(mon_ctx->shm_name, PATH_MAX, "%s/%u_%u_%s_%lu_%s.XXXXXX",
+		     outpath, getppid(), getpid(),
+		     ctx_type, job_id, hprov->name) < 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed so format shm name!\n");
+		return -EOVERFLOW;
+	}
+
+	FI_TRACE(hprov, FI_LOG_FABRIC, "[%s] Using file: %s\n",
+		 hprov->name, mon_ctx->shm_name);
+
+
+	old_umask = umask(0177);
+	fd = mkstemp(mon_ctx->shm_name);
+	umask(old_umask);
+	if (fd < 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to create shm (%s)\n",
+			strerror(errno));
+		return -FI_ENOENT;
+	}
+
+	if (fchmod(fd, mon_env.file_mode) != 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to chmod %s: %s\n",
+			mon_ctx->shm_name, strerror(errno));
+		goto error;
+	}
+
+	if (ftruncate(fd, sizeof (struct monitor_mapped_data)) != 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to truncate %s: %s\n",
+			mon_ctx->shm_name, strerror(errno));
+		goto error;
+	}
+	mon_ctx->share = mmap(0, sizeof (struct monitor_mapped_data), PROT_READ|PROT_WRITE,
+			      MAP_SHARED, fd, 0);
+	if (mon_ctx->share == MAP_FAILED) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to mmap: %s\n",
+			strerror(errno));
+		goto error;
+	}
+
+	mon_ctx->share->flags = mon_ctx->context_type;
+	mon_ctx->share->key = mon_ctx->key;
+
+	close(fd);
+	return FI_SUCCESS;
+error:
+	close(fd);
+	return -errno;
+}
+
 static inline struct monitor_context *monitor_ctx(struct hook_ep *ep)
 {
-	return &container_of(ep->domain->fabric, struct monitor_fabric,
-	                     fabric_hook)->mon_ctx;
+	struct monitor_fabric *hfabric = container_of(ep->domain->fabric,
+		struct monitor_fabric, fabric_hook);
+	struct monitor_context *mon_ctx;
+	uintptr_t key = (uintptr_t)ep;
+
+	HASH_FIND_PTR(hfabric->monitor_contexts, &key, mon_ctx);
+	if (mon_ctx == NULL) {
+		mon_ctx = calloc(1, sizeof(struct monitor_context));
+		mon_ctx->key = key;
+		mon_ctx->context_type = MON_CTX_TYPE_EP;
+		mon_ctx->api_size = mon_api_ep_size;
+		monitor_context_init(hfabric->hprov, mon_ctx);
+		HASH_ADD_PTR(hfabric->monitor_contexts, key, mon_ctx);
+	}
+
+	return mon_ctx;
 }
 
 static inline struct monitor_context *monitor_ctx_cq(struct hook_cq *cq)
 {
-	return &container_of(cq->domain->fabric, struct monitor_fabric,
-	                     fabric_hook)->mon_ctx;
+	struct monitor_fabric *hfabric = container_of(cq->domain->fabric,
+		struct monitor_fabric, fabric_hook);
+	struct monitor_context *mon_ctx = NULL;
+	uintptr_t key = (uintptr_t)cq;
+
+	HASH_FIND_PTR(hfabric->monitor_contexts, &key, mon_ctx);
+	if (mon_ctx == NULL) {
+		mon_ctx = calloc(1, sizeof(struct monitor_context));
+		mon_ctx->key = key;
+		mon_ctx->context_type = MON_CTX_TYPE_CQ;
+		mon_ctx->api_size = mon_api_cq_size;
+		monitor_context_init(hfabric->hprov, mon_ctx);
+		HASH_ADD_PTR(hfabric->monitor_contexts, key, mon_ctx);
+	}
+
+	return mon_ctx;
 }
 
 static inline struct monitor_context *monitor_ctx_domain(struct hook_domain *dom)
 {
-	return &container_of(dom->fabric, struct monitor_fabric,
-	                     fabric_hook)->mon_ctx;
+	struct monitor_fabric *hfabric = container_of(dom->fabric,
+		struct monitor_fabric, fabric_hook);
+	struct monitor_context *mon_ctx = NULL;
+	uintptr_t key = (uintptr_t)dom;
+
+	HASH_FIND_PTR(hfabric->monitor_contexts, &key, mon_ctx);
+	if (mon_ctx == NULL) {
+		mon_ctx = calloc(1, sizeof(struct monitor_context));
+		mon_ctx->key = key;
+		mon_ctx->context_type = MON_CTX_TYPE_DOM;
+		mon_ctx->api_size = mon_api_dom_size;
+		monitor_context_init(hfabric->hprov, mon_ctx);
+		HASH_ADD_PTR(hfabric->monitor_contexts, key, mon_ctx);
+	}
+
+	return mon_ctx;
 }
 
 static inline int mon_size_bucket(size_t len)
@@ -181,9 +371,9 @@ mon_flush(struct monitor_context *ctx) {
 	bool request = ctx->share->flags & 0b1;
 	if (request) {
 		// copy counters to share, clear request flag & reset local counters
-		memcpy(ctx->share, ctx->data, sizeof (ctx->data));
+		memcpy(ctx->share, ctx->data, sizeof(struct monitor_data) * ctx->api_size);
 		ctx->share->flags ^= 0b1;
-		memset(ctx->data, 0, sizeof (ctx->data));
+		memset(ctx->data, 0, sizeof(struct monitor_data) * ctx->api_size);
 	}
 }
 
@@ -863,152 +1053,9 @@ static int monitor_domain_init(struct fid *fid)
 	return 0;
 }
 
-static ofi_atomic64_t monitor_id;
-static int64_t monitor_get_id()
-{
-	ofi_atomic_add64(&monitor_id, 1);
-	return ofi_atomic_get64(&monitor_id);
-}
-
 static int
-monitor_shm_init(struct monitor_context *mon_ctx)
+monitor_context_close(const struct fi_provider *hprov, struct monitor_context *mon_ctx)
 {
-	const struct fi_provider *hprov = mon_ctx->hprov;
-	mode_t old_umask;
-	char outpath[PATH_MAX];
-	char hostname[PATH_MAX];
-	char buffer[PATH_MAX];
-	struct statfs info;
-	bool is_tmpfs;
-	unsigned long job_id;
-	const char* slurm_job_id_str;
-	unsigned int slurm_job_id;
-	char *endptr;
-	int fd;
-
-	errno = 0;
-	old_umask = umask(0);
-	if (mkdir(mon_env.basepath, 01777) != 0) {
-		if (errno != EEXIST) {
-			FI_WARN(hprov, FI_LOG_FABRIC,
-				"Could not create folder at %s: %s\n",
-				mon_env.basepath, strerror(errno));
-			umask(old_umask);
-			return -errno;
-		}
-	}
-	umask(old_umask);
-
-	// append UID to path, try to mkdir
-	if (snprintf(outpath, PATH_MAX, "%s/%u", mon_env.basepath, getuid()) < 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to format hook storage path!\n");
-		return -EOVERFLOW;
-	}
-	if (mkdir(outpath, mon_env.dir_mode) != 0) {
-		if (errno != EEXIST) {
-			FI_WARN(hprov, FI_LOG_FABRIC,
-				"Could not create folder at %s: %s\n",
-				outpath, strerror(errno));
-			return -errno;
-		}
-	}
-
-	// append hostname to path, try to mkdir
-	//  useful for containers which usually set hostname to the container name
-	if (gethostname(hostname, PATH_MAX) != 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to call gethostname (%s)!\n",
-			strerror(errno));
-		return -errno;
-	}
-	if (snprintf(buffer, PATH_MAX, "%s/%s", outpath, hostname) < 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to format outpath!\n");
-		return -EOVERFLOW;
-	}
-	strncpy(outpath, buffer, PATH_MAX);
-	errno = 0;
-	if (mkdir(outpath, mon_env.dir_mode) != 0) {
-		if (errno != EEXIST) {
-			FI_WARN(hprov, FI_LOG_FABRIC,
-				"Could not create folder at %s: %s\n",
-				outpath, strerror(errno));
-			return -errno;
-		}
-	}
-	statfs(outpath, &info);
-#ifdef __APPLE__
-	is_tmpfs = strncmp(info.f_fstypename, "tmpfs", 5) == 0;
-#else
-	is_tmpfs = info.f_type == TMPFS_MAGIC;
-#endif
-	if (!is_tmpfs) {
-		FI_WARN(hprov, FI_LOG_FABRIC,
-			"Communication file not on tmpfs! (%s) Proceed with caution.\n",
-			outpath);
-	}
-
-	job_id = 0;
-	slurm_job_id_str = getenv("SLURM_JOB_ID");
-	if (slurm_job_id_str != NULL) {
-		errno = 0;
-		slurm_job_id = strtoul(slurm_job_id_str, &endptr, 0);
-		if (errno == ERANGE || *endptr != '\0' || slurm_job_id_str == endptr)
-			FI_WARN(hprov, FI_LOG_FABRIC,
-				"Could not parse SLURM_JOB_ID!\n");
-		else
-			job_id = slurm_job_id;
-	}
-
-
-	if (snprintf(mon_ctx->shm_name, PATH_MAX, "%s/%u_%u_%" PRIu64 "_%lu_%s",
-		     outpath, getppid(), getpid(), monitor_get_id(),job_id,
-		     hprov->name) < 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed so format shm name!\n");
-		return -EOVERFLOW;
-	}
-
-	FI_TRACE(hprov, FI_LOG_FABRIC, "[%s] Using file: %s\n",
-		 hprov->name, mon_ctx->shm_name);
-
-	fd = open(mon_ctx->shm_name, O_CREAT | O_RDWR, S_IRUSR|S_IWUSR);
-	if (fd < 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to create shm (%s)\n",
-			strerror(errno));
-		return -FI_ENOENT;
-	}
-
-	if (fchmod(fd, mon_env.file_mode) != 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to chmod %s: %s\n",
-			mon_ctx->shm_name, strerror(errno));
-		goto error;
-	}
-
-	if (ftruncate(fd, sizeof (struct monitor_mapped_data)) != 0) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to truncate %s: %s\n",
-			mon_ctx->shm_name, strerror(errno));
-		goto error;
-	}
-	mon_ctx->share = mmap(0, sizeof (struct monitor_mapped_data), PROT_READ|PROT_WRITE,
-			      MAP_SHARED, fd, 0);
-	if (mon_ctx->share == MAP_FAILED) {
-		FI_WARN(hprov, FI_LOG_CORE, "Failed to mmap: %s\n",
-			strerror(errno));
-		goto error;
-	}
-
-	// flush data on init
-	mon_ctx->share->flags = 0b0;
-
-	close(fd);
-	return FI_SUCCESS;
-error:
-	close(fd);
-	return -errno;
-}
-
-static int
-monitor_shm_close(struct monitor_context *mon_ctx)
-{
-	const struct fi_provider *hprov = mon_ctx->hprov;
 	int ret;
 
 	if (mon_env.linger) {
@@ -1022,16 +1069,18 @@ monitor_shm_close(struct monitor_context *mon_ctx)
 
 		// check if data in shm has been read and add counters if not
 		if (!(old_flags & 0b1)) {
-			struct monitor_data old_data[mon_api_size];
-			memcpy(old_data, mon_ctx->share, sizeof (old_data));
-			for (int i = 0; i < mon_api_size; i++) {
+			struct monitor_data old_data[MON_DATA_SIZE];
+			memcpy(old_data, mon_ctx->share,
+				sizeof(struct monitor_data) * MON_DATA_SIZE);
+			for (int i = 0; i < MON_DATA_SIZE; i++) {
 				for(int j = 0; j < MON_SIZE_MAX; j++) {
 					mon_ctx->data[i].count[j] += old_data[i].count[j];
 					mon_ctx->data[i].sum[j] += old_data[i].sum[j];
 				}
 			}
 		}
-		memcpy(mon_ctx->share, mon_ctx->data, sizeof (mon_ctx->data));
+		memcpy(mon_ctx->share, mon_ctx->data,
+			sizeof(struct monitor_data) * MON_DATA_SIZE);
 		mon_ctx->share->flags |= 0b10; // set fin flag
 		mon_ctx->share->flags ^= 0b01; // clear request flag
 	} else {
@@ -1052,13 +1101,20 @@ monitor_shm_close(struct monitor_context *mon_ctx)
 
 static int hook_monitor_close(struct fid *fid)
 {
-	struct monitor_context *ctx =
-		&(container_of(fid, struct monitor_fabric, fabric_hook)->mon_ctx);
+	struct monitor_fabric *hfabric = container_of(fid, struct monitor_fabric,
+		fabric_hook);
 
-	monitor_shm_close(ctx);
+	struct monitor_context *mon_ctx, *tmp;
 
+	HASH_ITER(hh, hfabric->monitor_contexts, mon_ctx, tmp) {
+		monitor_context_close(hfabric->hprov, mon_ctx);
+		HASH_DEL(hfabric->monitor_contexts, mon_ctx);
+		free(mon_ctx);
+	}
+
+	FI_TRACE(hfabric->hprov, FI_LOG_CORE, "[%s] Closing monitor hook\n",
+		hfabric->hprov->name);
 	hook_close(fid);
-	FI_TRACE(ctx->hprov, FI_LOG_CORE, "[%s] Closing monitor hook\n", ctx->hprov->name);
 	return FI_SUCCESS;
 }
 
@@ -1078,7 +1134,6 @@ hook_monitor_fabric(struct fi_fabric_attr *attr,
 {
 	struct fi_provider *hprov = context;
 	struct monitor_fabric *fab;
-	int ret;
 
 	FI_TRACE(hprov, FI_LOG_FABRIC, "[%s] Installing monitor hook\n",
 		hprov->name);
@@ -1087,16 +1142,8 @@ hook_monitor_fabric(struct fi_fabric_attr *attr,
 	if (!fab)
 		return -FI_ENOMEM;
 
-	fab->mon_ctx.hprov = hprov;
-	memset(&fab->mon_ctx.data, 0, sizeof (fab->mon_ctx.data));
-
-	ofi_atomic_initialize64(&monitor_id, 0);
-	ret = monitor_shm_init(&fab->mon_ctx);
-	if (ret != FI_SUCCESS) {
-		FI_WARN(hprov, FI_LOG_FABRIC,
-			"Could not initialise ofi_hook_monitor!\n");
-		return -FI_EACCES;
-	}
+	fab->hprov = hprov;
+	fab->monitor_contexts = NULL;
 
 	hook_fabric_init(&fab->fabric_hook, HOOK_MONITOR, attr->fabric, hprov,
 	                 &monitor_fabric_fid_ops, &hook_monitor_ctx);
