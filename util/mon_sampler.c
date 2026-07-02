@@ -89,6 +89,10 @@
 #define INOFITY_ELEM_PER_BUF 32
 #define INOFITY_BUF_SIZE (INOFITY_ELEM_PER_BUF*(sizeof(struct inotify_event) + NAME_MAX + 1))
 
+#define ADAPTIVE_NUM_SAMPLES 64
+#define ADAPTIVE_NUM_SAMPLES_EDGE 16
+#define ADAPTIVE_PERCENTILE 0.92
+
 enum ms_formats {
 	MS_CSV=0,
 	MS_INFLUX=1
@@ -103,6 +107,7 @@ struct ms_opts {
 	bool use_stdout;
 	bool verbose;
 	bool should_log;
+	double cpu_adapt_target;
 };
 
 struct file_entry {
@@ -130,6 +135,19 @@ struct inotify_entry {
 	char path[PATH_MAX];
 };
 #endif
+
+struct ct_cpu_time {
+	double cpu_percentage;
+	double cpu_time_ms;
+	struct timespec cpu_time;
+	clockid_t clock_id;
+};
+
+struct ring_buffer {
+	double values[ADAPTIVE_NUM_SAMPLES];
+	size_t idx;
+	const size_t size;
+};
 
 struct ct_mon_sampler {
 	struct ms_opts opts;
@@ -159,6 +177,12 @@ struct ct_mon_sampler {
 	size_t buffer_num_elements;
 	size_t buffer_offset;
 	time_t last_push;
+
+	/* adaptivity components */
+	struct ring_buffer observations;
+	struct ct_cpu_time cpu_time;
+	size_t edge_cooldown;
+	useconds_t usec_since_last_edge;
 };
 
 struct ct_pusher {
@@ -174,6 +198,12 @@ struct ct_pusher {
 	FILE *f_log_pusher;
 
 	long speed_limit_bs;
+
+
+	/* adaptivity components */
+	clockid_t clock_id;
+	struct ct_cpu_time cpu_time;
+	double cpu_adapt_target;
 };
 
 
@@ -240,6 +270,135 @@ static inline double timespec_to_ms(struct timespec interval) {
 	return ((double)interval.tv_sec * 1e3) + ((double)interval.tv_nsec / 1e6);
 }
 
+static int get_cpu_time_perc(struct ct_cpu_time *ctime, double period_ms) {
+        struct timespec cpu_time_now;
+
+        if (clock_gettime(ctime->clock_id, &cpu_time_now) == -1)
+            goto error;
+
+        ctime->cpu_time_ms = timespec_to_ms(timespec_diff(&cpu_time_now, &ctime->cpu_time));
+        ctime->cpu_percentage = (ctime->cpu_time_ms / period_ms) * 100;
+
+        ctime->cpu_time.tv_sec = cpu_time_now.tv_sec;
+        ctime->cpu_time.tv_nsec = cpu_time_now.tv_nsec;
+
+        return 0;
+
+error:
+        fprintf(stderr, "Error while getting CPU time: %s\n",
+                strerror(errno));
+        return -1;
+}
+
+/*******************************************************************************
+ *                         Adaptivity Components
+ ******************************************************************************/
+
+static void adaptive_add_sample(struct ring_buffer *ring, double value) {
+	ring->values[ring->idx] = value;
+	ring->idx += 1;
+	if (ring->idx >= ring->size)
+		ring->idx = 0;
+}
+
+static int compare_d( const void* a, const void* b) {
+     double double_a = *((double*)a);
+     double double_b = *((double*)b);
+
+     if ( double_a == double_b ) return 0;
+     if ( double_a < double_b ) return -1;
+     return 1;
+}
+
+static double adaptive_get_q(struct ring_buffer *ring, double *tmp, double q) {
+	assert (q >= 0 && q <= 1);
+	memcpy(tmp, ring->values, sizeof(double) * ring->size);
+	qsort(tmp, ring->size, sizeof(double), compare_d);
+	size_t populated_entries = 0;
+	for (int i = 0; i < ring->size; i++) {
+		populated_entries += ring->values[i] >= 0;
+	}
+
+	const int idx = ring->size - (populated_entries - (int)(populated_entries * q));
+	return tmp[idx];
+}
+
+static double adaptive_get_mean_ring(struct ring_buffer *ring, size_t start,
+	size_t n) {
+	double mean = 0;
+	size_t num_entries = 0;
+	size_t idx = start;
+	for (int i = 0; i < n; i++) {
+		if (idx == 0)
+			idx = ring->size-1;
+		else
+			idx -= 1; // idx points to first "free" entry
+
+		if (ring->values[idx] >= 0) {
+			mean += ring->values[idx];
+			num_entries += 1;
+		}
+	}
+	if (num_entries > 0)
+		mean /= num_entries;
+	return mean;
+}
+
+static void adaptive_clear_ring(struct ring_buffer *ring, size_t start,
+	size_t n) {
+	size_t idx = start;
+	for (int i = 0; i < n; i++) {
+		if (idx == 0)
+			idx = ring->size-1;
+		else
+			idx -= 1;
+		ring->values[idx] = -1;
+	}
+}
+
+static bool adaptive_detect_edge(struct ring_buffer *ring) {
+	const size_t n = ADAPTIVE_NUM_SAMPLES_EDGE/2;
+	const size_t start_a = ring->idx;
+	const size_t start_b = ring->idx >= n ?
+		ring->idx - n :
+		ADAPTIVE_NUM_SAMPLES - (n - ring->idx);
+
+
+	const double mean_a = adaptive_get_mean_ring(ring, start_a, n);
+	const double mean_b = adaptive_get_mean_ring(ring, start_b, n);
+
+	const double abs_delta = mean_b - mean_a >= 0 ?
+		mean_b - mean_a : mean_a - mean_b;
+
+	const double min = mean_b < mean_a ?
+		mean_b : mean_a;
+	return abs_delta > 2*min;
+}
+
+static useconds_t adaptive_get_prediction(struct ct_mon_sampler *ct,
+	double* sort_buffer, double percentile, double *cpu_time_pred_ms) {
+
+	struct ring_buffer *ring = &ct->observations;
+	ct->edge_cooldown -= ct->edge_cooldown != 0;
+
+	if ((ct->edge_cooldown == 0 || ct->usec_since_last_edge >= 1*1e6) 
+		&& adaptive_detect_edge(ring)) {
+		const size_t n = ADAPTIVE_NUM_SAMPLES_EDGE/2;
+		const size_t idx = ring->idx >= n ?
+			ring->idx - n :
+			ADAPTIVE_NUM_SAMPLES - (n - ring->idx);
+
+		adaptive_clear_ring(ring, idx, ADAPTIVE_NUM_SAMPLES-n);
+		ct->edge_cooldown = ADAPTIVE_NUM_SAMPLES_EDGE/2;
+		ct->usec_since_last_edge = 0;
+	}
+
+	*cpu_time_pred_ms = adaptive_get_q(ring, sort_buffer, percentile);
+	const double sleep_usec = ((1 / ct->opts.cpu_adapt_target) - 1) * *cpu_time_pred_ms*1000;
+	return sleep_usec < ct->opts.watch_usec ?
+		(useconds_t)ct->opts.watch_usec : (useconds_t)sleep_usec;
+}
+
 /*******************************************************************************
  *                         Metric Pusher
  ******************************************************************************/
@@ -300,7 +459,8 @@ curl_error:
 }
 
 static int pusher_post_data(struct ct_pusher *pusher) {
-	struct timespec t1, t2, tnow;
+	struct timespec t1, t2, tnow,
+			cpu_t1, cpu_t2;
 	long http_code = 0;
 	CURLcode code;
 
@@ -315,12 +475,14 @@ static int pusher_post_data(struct ct_pusher *pusher) {
 				(curl_off_t)pusher->buffer_size);
 	if (code != CURLE_OK) goto curl_error;
 
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_t1) == -1) goto error;
 	if (clock_gettime(CLOCK_MONOTONIC, &t1) == -1) goto error;
 
 	code = curl_easy_perform(pusher->curl_handle);
 	if (code != CURLE_OK) goto curl_error;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &t2) == -1) goto error;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_t2) == -1) goto error;
 
 	code = curl_easy_getinfo(pusher->curl_handle, CURLINFO_RESPONSE_CODE, &http_code);
 	if (code != CURLE_OK) goto curl_error;
@@ -330,12 +492,27 @@ static int pusher_post_data(struct ct_pusher *pusher) {
 
 	if (pusher->f_log_pusher) {
 		const double run_ms = timespec_to_ms(timespec_diff(&t2, &t1));
+		const double cpu_ms = timespec_to_ms(timespec_diff(&cpu_t2, &cpu_t1));
+		// const double offset = run_ms - pusher->buffer_size*pusher->speed_limit_bs;
 
 		if (clock_gettime(CLOCK_REALTIME, &tnow) == -1) goto error;
-		fprintf(pusher->f_log_pusher, "%zu.%09zu,%zu,%f\n",
+		fprintf(pusher->f_log_pusher, "%zu.%09zu,%zu,%f,%f,%li\n",
 			tnow.tv_sec, tnow.tv_nsec,
 			pusher->buffer_size,
-			run_ms);
+			run_ms,
+			cpu_ms, pusher->speed_limit_bs);
+
+		if (pusher->cpu_adapt_target != 0) {
+			const double desired_upload_ms = cpu_ms / pusher->cpu_adapt_target;
+			pusher->speed_limit_bs *= run_ms / desired_upload_ms;
+
+			code = curl_easy_setopt(pusher->curl_handle,
+				CURLOPT_MAX_SEND_SPEED_LARGE,
+				pusher->speed_limit_bs);
+			if (code != CURLE_OK)
+				goto curl_error;
+		}
+
 	}
 	pusher->buffer_size = 0;
 
@@ -1134,12 +1311,25 @@ static int ms_init_pusher(struct ct_mon_sampler *ct) {
 	if (ret != 0) return ret;
 
 	ct->pusher->speed_limit_bs = ct->opts.buffer_size;
+	ret = pthread_getcpuclockid(ct->pusher_thread, &ct->pusher->cpu_time.clock_id);
+	if (ret != 0) return ret;
+
+	ct->pusher->cpu_adapt_target = ct->opts.cpu_adapt_target;
+
+	ct->pusher->speed_limit_bs = ct->opts.buffer_size;
 	envstr = getenv(MON_SAMPLER_SPEED_LIMIT_KBS_ENV);
 	if (envstr != NULL) {
 		out = strtoul(envstr, &endptr, 0);
 		if (errno == ERANGE || *endptr != '\0' || envstr == endptr)
 			goto error_strtol;
 		ct->pusher->speed_limit_bs = out * 1000;
+
+		if (ct->pusher->cpu_adapt_target != 0) {
+			fprintf(stderr, "Warning: Enabled adaptivity and manually "
+				"set Curl Speed Limit! Will disable adaptivity "
+				"for pusher.\n");
+			ct->pusher->cpu_adapt_target = 0;
+		}
 	}
 
 	return 0;
@@ -1160,7 +1350,7 @@ static int ms_init_perf_log(struct ct_mon_sampler *ct) {
 		ct->pusher->f_log_pusher = fopen(fpath, "w");
 		if (ct->pusher->f_log_pusher == NULL) goto error;
 		fprintf(ct->pusher->f_log_pusher,
-			"time,buffer_size_bytes,upload_time_ms\n");
+			"time,buffer_size_bytes,upload_time_ms,cpu_time_ms,speed_limit_bs\n");
 	}
 
 	env_str = getenv(MON_SAMPLER_PERF_LOG_SAMPLER_OUTPATH_ENV);
@@ -1169,8 +1359,11 @@ static int ms_init_perf_log(struct ct_mon_sampler *ct) {
 	ct->f_log_sampler = fopen(fpath, "w");
 	if (ct->f_log_sampler == NULL) goto error;
 	fprintf(ct->f_log_sampler,
-		"time,num_files,sample_time_ms,serialized_elements,"
-		"serialized_bytes,procs_with_data\n");
+		"time,num_files,sample_time_ms,cpu_time_ms,cpu_perc,"
+		"expected_cpu_time_ms,expected_cpu_perc,"
+		"cpu_time_pusher_ms,cpu_perc_pusher,"
+		"serialized_elements,serialized_bytes,procs_with_data,"
+		"wait_next_us,has_detected_edge\n");
 	return 0;
 
 error:
@@ -1210,6 +1403,7 @@ static int ms_init_sampler(struct ct_mon_sampler *ct) {
 	dlist_init(&ct->files);
 
 	running_sampler = ct->opts.watch_usec > 0;
+	memset(ct->observations.values, -1, sizeof(double) * ADAPTIVE_NUM_SAMPLES);
 
 	if (ct->pusher) {
 		ret = ms_init_pusher(ct);
@@ -1220,6 +1414,7 @@ static int ms_init_sampler(struct ct_mon_sampler *ct) {
 		}
 	}
 
+	ct->cpu_time = (struct ct_cpu_time) { .clock_id = CLOCK_THREAD_CPUTIME_ID };
 	if (ct->opts.should_log)
 		ms_init_perf_log(ct);
 
@@ -1267,6 +1462,8 @@ static void ms_usage(char *name) {
 			MON_SAMPLER_PUSHER_BUFFER_SIZE_KIB_DEFAULT);
 	fprintf(stderr, " %-20s %s\n", "-l", "enable performance logging of "
 			"sampler (see Environment Variables for output settings)");
+	fprintf(stderr, " %-20s %s\n", "-a <threshold>",
+			"enable adaptivity to <threshold>%% CPU usage");
 	fprintf(stderr, " %-20s %s\n", "-v", "enable verbose output");
 
 	fprintf(stderr, "\n\n");
@@ -1296,8 +1493,9 @@ static void ms_usage(char *name) {
 static int ms_parse_opts(int argc, char** argv, struct ct_mon_sampler *ct) {
 	char *endptr;
 	unsigned long long_out;
+	double double_out;
 	int op;
-	while ((op = getopt(argc, argv, "hvw:f:o:r:sm:l")) != -1) {
+	while ((op = getopt(argc, argv, "hvw:f:o:r:sm:la:")) != -1) {
 		switch (op) {
 		case '?':
 		case 'h':
@@ -1350,6 +1548,16 @@ static int ms_parse_opts(int argc, char** argv, struct ct_mon_sampler *ct) {
 				return -EINVAL;
 			}
 			ct->opts.buffer_size = long_out*1024;
+			break;
+		case 'a':
+			double_out = strtod(optarg, &endptr);
+			if (errno == ERANGE || *endptr != '\0' ||
+			    optarg == endptr) {
+				fprintf(stderr, "Invalid double '%s'\n",
+					optarg);
+				return -EINVAL;
+			}
+			ct->opts.cpu_adapt_target = double_out;
 			break;
 		default:
 			break;
@@ -1472,24 +1680,40 @@ int main(int argc, char **argv) {
 			.watch_usec = 0,
 			.verbose = false,
 			.use_stdout =  false,
+			.cpu_adapt_target = 0,
 		},
 		.last_push = time(NULL),
 		.buffer_offset= 0,
 		.buffer_in_use = 0,
+		.observations = {
+			.size = ADAPTIVE_NUM_SAMPLES,
+			.idx = 0,
+		},
 	};
 	int ret = 0;
-	struct timespec t1, t2, tnow;
+	struct timespec t1, t2, tperiod, tnow;
 	struct sigaction saction = { .sa_handler = sigint_handler };
 
-	double run_ms = 0;
+	double period_ms = 0, run_ms = 0, cpu_time_pred_ms = 0;
+	double sort_buffer[ADAPTIVE_NUM_SAMPLES];
+	useconds_t sleep_usec = 0;
+
 	if (sigaction(SIGINT, &saction, NULL) == -1) goto error_errno;
 
 	ret = ms_parse_opts(argc, argv, &ct);
 	if (ret != 0) goto error;
 
+	sleep_usec = (useconds_t)ct.opts.watch_usec;
+
 	ret = ms_init_sampler(&ct);
 	if (ret != 0) goto error;
 
+	if (clock_gettime(CLOCK_MONOTONIC, &tperiod) == -1)
+		goto error_errno;
+	if (clock_gettime(ct.cpu_time.clock_id,	&ct.cpu_time.cpu_time) == -1)
+		goto error_errno;
+	if (ct.pusher && clock_gettime(ct.pusher->cpu_time.clock_id, &ct.pusher->cpu_time.cpu_time) == -1)
+		goto error_errno;
 	do {
 		if (clock_gettime(CLOCK_MONOTONIC, &t1) == -1) goto error_errno;
 		ret = ms_run(&ct);
@@ -1497,26 +1721,59 @@ int main(int argc, char **argv) {
 
 		if (clock_gettime(CLOCK_MONOTONIC, &t2) == -1) goto error_errno;
 		run_ms = timespec_to_ms(timespec_diff(&t2, &t1));
+		period_ms = timespec_to_ms(timespec_diff(&t2, &tperiod));
+		tperiod.tv_sec = t2.tv_sec;
+		tperiod.tv_nsec = t2.tv_nsec;
+
+		ret = get_cpu_time_perc(&ct.cpu_time, period_ms);
+		if (ret < 0) goto error;
+
+		if (ct.opts.cpu_adapt_target != 0) {
+			ct.usec_since_last_edge += (useconds_t)(run_ms*1000);
+
+			adaptive_add_sample(&ct.observations,
+				ct.cpu_time.cpu_time_ms);
+			sleep_usec = adaptive_get_prediction(&ct, (double*)&sort_buffer, ADAPTIVE_PERCENTILE,
+				&cpu_time_pred_ms);
+
+			ct.usec_since_last_edge += sleep_usec;
+		} else {
+			sleep_usec = run_ms * 1000 < ct.opts.watch_usec ?
+				(useconds_t)ct.opts.watch_usec - run_ms*1000 :
+				(useconds_t)ct.opts.watch_usec;
+		}
 
 		if (ct.opts.verbose) {
 			printf("Spent %8.2f ms / %6lu ms (%8.2f left) "
-				"for %2zu files\n",
+				"for %2zu files (%6.2f%% CPU, %4.1fHz)\n",
 				run_ms, ct.opts.watch_usec / 1000,
 				((double)ct.opts.watch_usec / 1000.) - run_ms,
-				ct.num_files);
+				ct.num_files, ct.cpu_time.cpu_percentage, 1/(period_ms/1000.));
 		}
 
 		if (ct.opts.should_log) {
+			if (ct.pusher) {
+				ret = get_cpu_time_perc(&ct.pusher->cpu_time, period_ms);
+				if (ret < 0) goto error;
+			}
 			if (clock_gettime(CLOCK_REALTIME, &tnow) == -1) goto error_errno;
+			const double cpu_time_pred_perc = (cpu_time_pred_ms / (cpu_time_pred_ms+(sleep_usec/1000.))) * 100;
 			fprintf(ct.f_log_sampler,
-				"%zu.%09zu,%zu,%f,%li,%li,%zu\n",
+				"%zu.%09zu,%zu,%f,%f,%f,%f,%f,%f,%f,%li,%li,%zu,%d,%b\n",
 				tnow.tv_sec, tnow.tv_nsec, ct.num_files,
 				run_ms,
+				ct.cpu_time.cpu_time_ms, ct.cpu_time.cpu_percentage,
+				cpu_time_pred_ms, cpu_time_pred_perc,
+				ct.pusher ? ct.pusher->cpu_time.cpu_time_ms : 0,
+				ct.pusher ? ct.pusher->cpu_time.cpu_percentage : 0,
 				ct.serialized_elements,
 				ct.serialized_bytes,
-				ct.procs_with_data);
+				ct.procs_with_data,
+				sleep_usec + (useconds_t)(run_ms*1000),
+				ct.edge_cooldown == ADAPTIVE_NUM_SAMPLES_EDGE/2);
 		}
-		usleep((useconds_t)ct.opts.watch_usec);
+		
+		usleep(sleep_usec);
 		running_sampler &= ret == 0;
 	} while (running_sampler);
 
