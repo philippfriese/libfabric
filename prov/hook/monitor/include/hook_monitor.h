@@ -35,6 +35,7 @@
 
 #include "ofi_hook.h"
 #include "ofi.h"
+#include "uthash.h"
 
 #define MON_IGNORE_SIZE  0
 #define MON_TICK_MAX_DEFAULT 1024
@@ -44,7 +45,7 @@
 #define MON_DIR_MODE_DEFAULT 01700
 
 // Note: keep in-sync with util/mon_sampler.c
-#define MONITOR_APIS(DECL)  \
+#define MONITOR_APIS_EP(DECL)  \
 	DECL(mon_recv),  \
 	DECL(mon_recvv), \
 	DECL(mon_recvmsg), \
@@ -71,10 +72,10 @@
 	DECL(mon_writemsg),  \
 	DECL(mon_inject_write),  \
 	DECL(mon_writedata),  \
-	DECL(mon_inject_writedata),  \
-	DECL(mon_mr_reg),  \
-	DECL(mon_mr_regv),  \
-	DECL(mon_mr_regattr),  \
+	DECL(mon_inject_writedata), \
+	DECL(mon_api_ep_size)
+
+#define MONITOR_APIS_CQ(DECL)  \
 	DECL(mon_cq_read),  \
 	DECL(mon_cq_readfrom),	 \
 	DECL(mon_cq_readerr),  \
@@ -87,11 +88,28 @@
 	DECL(mon_cq_data_rx),	\
 	DECL(mon_cq_tagged_tx),  \
 	DECL(mon_cq_tagged_rx),    \
-	DECL(mon_api_size)
+	DECL(mon_api_cq_size)
 
-enum mon_api_counters {
-	MONITOR_APIS(OFI_ENUM_VAL)
+#define MONITOR_APIS_DOM(DECL)  \
+	DECL(mon_mr_reg),  \
+	DECL(mon_mr_regv),  \
+	DECL(mon_mr_regattr),  \
+	DECL(mon_api_dom_size)
+
+enum mon_api_ep_counters {
+	MONITOR_APIS_EP(OFI_ENUM_VAL)
 };
+enum mon_api_cq_counters {
+	MONITOR_APIS_CQ(OFI_ENUM_VAL)
+};
+enum mon_api_dom_counters {
+	MONITOR_APIS_DOM(OFI_ENUM_VAL)
+};
+
+// Keep size of monitor_mapped_data constant for all context types, allowing
+// static mmap of struct monitor_mapped_data. Context type EP is largest with
+// 3888 bytes, fitting in page cache used by tmpfs (recommended storage backend).
+#define MON_DATA_SIZE (mon_api_ep_size)
 
 enum mon_size_bucket {
 	MON_SIZE_0_64 = 0,
@@ -103,7 +121,7 @@ enum mon_size_bucket {
 	MON_SIZE_256K_1M,
 	MON_SIZE_1M_4M,
 	MON_SIZE_4M_UP,
-	MON_SIZE_MAX
+	MON_SIZE_MAX,
 };
 
 struct monitor_data {
@@ -112,35 +130,54 @@ struct monitor_data {
 };
 
 struct monitor_mapped_data {
-	struct monitor_data data[mon_api_size];
+	struct monitor_data data[MON_DATA_SIZE];
 
 	/* Synchronisation Flag
 	 * bit 0    : data flush request
 	 * bit 1    : termination finished
-	 * remainder: reserved
+	 * bit 2,3,4: reserved
+	 * bit 5    : type dom
+	 * bit 6    : type cq
+	 * bit 7    : type eq
 	 */
 	_Atomic uint8_t flags;
+	uintptr_t key;
+};
+
+enum monitor_context_type {
+	MON_CTX_TYPE_EP   = 0b10000000,
+	MON_CTX_TYPE_CQ   = 0b01000000,
+	MON_CTX_TYPE_DOM  = 0b00100000,
+	MON_CTX_TYPE_MASK = MON_CTX_TYPE_EP | MON_CTX_TYPE_CQ | MON_CTX_TYPE_DOM,
 };
 
 struct monitor_context {
-	const struct fi_provider *hprov;
+	uintptr_t key;
+	enum monitor_context_type context_type;
+
+	size_t api_size;
 
 	// internal counter data
-	struct monitor_data data[mon_api_size];
-
-	// current number of hooked API calls
-	unsigned int tick;
+	struct monitor_data data[MON_DATA_SIZE];
 
 	// external counter data, shared via communication file
 	struct monitor_mapped_data* share;
 
 	// name of communication file
 	char shm_name[PATH_MAX];
+
+	// current number of hooked API calls
+	unsigned int tick;
+
+	UT_hash_handle hh;
 };
 
 struct monitor_fabric {
 	struct hook_fabric fabric_hook;
-	struct monitor_context mon_ctx;
+
+	const struct fi_provider *hprov;
+
+	struct monitor_context *monitor_contexts;
 };
 
 struct monitor_environment {

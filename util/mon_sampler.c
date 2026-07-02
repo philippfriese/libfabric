@@ -110,6 +110,8 @@ struct ms_opts {
 struct file_entry {
 	char in_path[PATH_MAX];
 	char out_path[PATH_MAX];
+	size_t num_functions;
+	const char **function_names;
 	struct monitor_mapped_data* share;
 	struct dlist_entry list_entry;
 	FILE *output;
@@ -117,9 +119,10 @@ struct file_entry {
 	int uid;
 	int ppid;
 	int pid;
-	int64_t monitor_id;
 	unsigned long job_id;
 	char provider_name[PROVIDER_NAME_LEN];
+	char context_type[4];
+	uintptr_t context_id;
 	bool is_mapped;
 	bool finalize;
 	bool header_written;
@@ -135,7 +138,7 @@ struct inotify_entry {
 
 struct ct_mon_sampler {
 	struct ms_opts opts;
-	struct monitor_data data[mon_api_size];
+	struct monitor_data data[mon_api_ep_size];
 	mode_t target_mode;
 	struct dlist_entry files;
 	size_t num_files;
@@ -180,7 +183,7 @@ struct ct_pusher {
 
 
 // Note: keep in-sync with prov/hook/monitor/include/hook_monitor.h
-static const char *mon_functions[] = {
+static const char *mon_functions_ep[] = {
 	"mon_recv",         "mon_recvv",        "mon_recvmsg",
 	"mon_trecv",        "mon_trecvv",       "mon_trecvmsg",
 	"mon_send",         "mon_sendv",        "mon_sendmsg",
@@ -190,11 +193,17 @@ static const char *mon_functions[] = {
 	"mon_read",         "mon_readv",        "mon_readmsg",
 	"mon_write",        "mon_writev",       "mon_writemsg",
 	"mon_inject_write", "mon_writedata",    "mon_inject_writedata",
-	"mon_mr_reg",       "mon_mr_regv",      "mon_mr_regattr",
+};
+
+static const char *mon_functions_cq[] = {
 	"mon_cq_read",      "mon_cq_readfrom",  "mon_cq_readerr",
 	"mon_cq_sread",     "mon_cq_sreadfrom", "mon_cq_ctx",
 	"mon_cq_msg_tx",    "mon_cq_msg_rx",    "mon_cq_data_tx",
 	"mon_cq_data_rx",   "mon_cq_tagged_tx", "mon_cq_tagged_rx",
+};
+
+static const char *mon_functions_dom[] = {
+	"mon_mr_reg",       "mon_mr_regv",      "mon_mr_regattr",
 };
 
 static const char* mon_buckets[] = {
@@ -370,18 +379,18 @@ error:
 
 static int ms_serialize_csv(struct ct_mon_sampler *ct, struct file_entry *file,
 	char *buffer, size_t *offset, size_t buffer_size) {
-	int bytes_written;
+	int bytes_written = 0;
 	if (!file->header_written) {
-		for (int i = 0; i < mon_api_size; i++) {
+		for (int i = 0; i < file->num_functions; i++) {
 			for (int j = 0; j < MON_SIZE_MAX; j++) {
 				bytes_written = snprintf(buffer + *offset, buffer_size - *offset,
 					"%s_%s_c,%s_%s_s",
-					mon_functions[i], mon_buckets[j],
-					mon_functions[i], mon_buckets[j]);
+					file->function_names[i], mon_buckets[j],
+					file->function_names[i], mon_buckets[j]);
 				if (bytes_written >= buffer_size - *offset)
 					return -EMSGSIZE;
 				*offset += bytes_written;
-				if (!(i + 1 == mon_api_size && j + 1 == MON_SIZE_MAX)){
+				if (!(i + 1 == file->num_functions && j + 1 == MON_SIZE_MAX)){
 					bytes_written = snprintf(buffer + *offset, buffer_size - *offset, ",");
 					if (bytes_written >= buffer_size - *offset)
 						return -EMSGSIZE;
@@ -389,14 +398,14 @@ static int ms_serialize_csv(struct ct_mon_sampler *ct, struct file_entry *file,
 				}
 			}
 		}
-		bytes_written+= snprintf(buffer + *offset, buffer_size - *offset, "\n");
+		bytes_written += snprintf(buffer + *offset, buffer_size - *offset, "\n");
 		if (bytes_written >= buffer_size - *offset)
 			return -EMSGSIZE;
 		*offset += bytes_written;
 		file->header_written = true;
 	}
 
-	for (int i = 0; i < mon_api_size; i++) {
+	for (int i = 0; i < file->num_functions; i++) {
 		for (int j = 0; j < MON_SIZE_MAX; j++) {
 			bytes_written = snprintf(buffer + *offset, buffer_size - *offset,
 				"%" PRIu64 ",%" PRIu64,
@@ -404,7 +413,7 @@ static int ms_serialize_csv(struct ct_mon_sampler *ct, struct file_entry *file,
 			if (bytes_written >= buffer_size - *offset)
 				return -EMSGSIZE;
 			*offset += bytes_written;
-			if (!(i + 1 == mon_api_size && j + 1 == MON_SIZE_MAX)){
+			if (!(i + 1 == file->num_functions && j + 1 == MON_SIZE_MAX)){
 				bytes_written = snprintf(buffer + *offset, buffer_size - *offset, ",");
 				if (bytes_written >= buffer_size - *offset)
 					return -EMSGSIZE;
@@ -422,26 +431,28 @@ static int ms_serialize_csv(struct ct_mon_sampler *ct, struct file_entry *file,
 static int ms_serialize_influx(struct ct_mon_sampler *ct, struct file_entry *file,
 	char* buffer, size_t *offset, size_t buffer_size) {
 	struct timespec spec;
-	int bytes_written;
+	int bytes_written = 0;
 	uint64_t now;
 	clock_gettime(CLOCK_REALTIME, &spec);
 	now = (uint64_t) spec.tv_sec * 1000000000L + (uint64_t) spec.tv_nsec;
-	for(int i = 0; i < mon_api_size; i++) {
+	for(int i = 0; i < file->num_functions; i++) {
 		for (int j = 0; j < MON_SIZE_MAX; j++) {
 			if (ct->data[i].count[j] == 0 && ct->data[i].sum[j] == 0)
 				continue;
 			bytes_written = snprintf(
 					buffer + *offset,
 					buffer_size - *offset,
-					"ofi_hook_monitor,function=%s,bucket=%s,"
-					"pid=%i,ppid=%i,monitor_id=%li,job_id=%" PRIu64 ","
-					"provider=%s,hostname=%s,uid=%i"
-					" count=%" PRIu64 ",sum=%" PRIu64 " %" PRIu64 "\n",
-					mon_functions[i], mon_buckets[j],
-					file->pid, file->ppid,
-					file->monitor_id, file->job_id,
-					file->provider_name, file->hostname,
-					file->uid,
+					"ofi_hook_monitor,"
+					"job_id=%" PRIu64 ",hostname=%s,uid=%i,"
+					"ppid=%i,pid=%i,provider=%s,"
+					"context_type=%s,context_id=%p,"
+					"function=%s,bucket=%s"
+					" count=%" PRIu64 ",sum=%" PRIu64
+					" %" PRIu64 "\n",
+					file->job_id, file->hostname, file->uid,
+					file->ppid, file->pid, file->provider_name,
+					file->context_type, (void*)file->context_id,
+					file->function_names[i], mon_buckets[j],
 					ct->data[i].count[j], ct->data[i].sum[j],
 					now);
 			if (bytes_written >= buffer_size - *offset)
@@ -625,16 +636,15 @@ static int ms_create_file_entry(struct ct_mon_sampler *ct, struct file_entry *fi
 	token = strtok_r(remainder, "_", &remainder);
 	file->pid = (int)strtol(token, &endptr, 10);
 	if (*endptr) goto error_strtol;
-
 	token = strtok_r(remainder, "_", &remainder);
-	file->monitor_id = (int64_t)strtol(token, &endptr, 10);
-	if (*endptr) goto error_strtol;
+	strncpy(file->context_type, token, 3);
 
 	token = strtok_r(remainder, "_", &remainder);
 	file->job_id = strtol(token, &endptr, 10);
 	if (*endptr) goto error_strtol;
 
-	strncpy(file->provider_name, remainder, PROVIDER_NAME_LEN-1);
+	token = strtok_r(remainder, ".", &remainder);
+	strncpy(file->provider_name, token, PROVIDER_NAME_LEN-1);
 
 	strncpy(file_path, file->in_path, PATH_MAX);
 	remainder = basename(dirname(file_path));
@@ -646,7 +656,25 @@ static int ms_create_file_entry(struct ct_mon_sampler *ct, struct file_entry *fi
 	file->uid = (int64_t)strtol(token, &endptr, 10);
 	if (*endptr) goto error_strtol;
 
+	file->context_id = file->share->key;
 
+	switch (file->share->flags & MON_CTX_TYPE_MASK) {
+	case MON_CTX_TYPE_EP:
+		file->num_functions = mon_api_ep_size;
+		file->function_names = mon_functions_ep;
+		break;
+	case MON_CTX_TYPE_CQ:
+		file->num_functions = mon_api_cq_size;
+		file->function_names = mon_functions_cq;
+		break;
+	case MON_CTX_TYPE_DOM:
+		file->num_functions = mon_api_dom_size;
+		file->function_names = mon_functions_dom;
+		break;
+	default:
+		fprintf(stderr, "Unknown source '%s'\n", file->context_type);
+		return -EINVAL;
+	}
 
 	switch (ct->opts.format) {
 		case MS_CSV:
