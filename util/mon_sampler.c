@@ -1438,8 +1438,6 @@ error_buffers:
 }
 
 static void ms_usage(char *name) {
-	fprintf(stderr, "Sampler for ofi_hook_monitor provider\n\n");
-
 	fprintf(stderr, "Usage:\n");
 	fprintf(stderr, "  %s [OPTIONS] <target>\t"
 			"start sampler on ofi_hook_monitor output target <target> "
@@ -1447,24 +1445,26 @@ static void ms_usage(char *name) {
 			name);
 
 	fprintf(stderr, "\nOptions:\n");
-	fprintf(stderr, " %-20s %s\n", "-w <msec>",
+	fprintf(stderr, " %-25s %s\n", "-w --watch <msec>",
 			"watch file for changes, wait <msec> milliseconds between checks");
-	fprintf(stderr, " %-20s %s\n", "-f <format>",
+	fprintf(stderr, " %-25s %s\n", "-f --format <format>",
 			"output format (CSV,INFLUX)");
-	fprintf(stderr, " %-20s %s\n", "-o <outpath>",
+	fprintf(stderr, " %-25s %s\n", "-o --output <outpath>",
 			"output file");
-	fprintf(stderr, " %-20s %s\n", "-s",
-			"print output to stdout (only for file target)");
-	fprintf(stderr, " %-20s %s\n", "-r <remote URL>",
+	fprintf(stderr, " %-25s %s\n", "-r --remote <remote URL>",
 			"URL of remote output database");
-	fprintf(stderr, " %-20s %s (default: %i)\n", "-m <kib>",
+	fprintf(stderr, " %-25s %s\n", "-s --stdout",
+			"print output to stdout (only for file target)");
+	fprintf(stderr, " %-25s %s (default: %i)\n", "-m --buffer-size <kib>",
 			"size of pusher data buffer in KiB",
 			MON_SAMPLER_PUSHER_BUFFER_SIZE_KIB_DEFAULT);
-	fprintf(stderr, " %-20s %s\n", "-l", "enable performance logging of "
+	fprintf(stderr, " %-25s %s\n", "-l --log", "enable performance logging of "
 			"sampler (see Environment Variables for output settings)");
-	fprintf(stderr, " %-20s %s\n", "-a <threshold>",
-			"enable adaptivity to <threshold>%% CPU usage");
-	fprintf(stderr, " %-20s %s\n", "-v", "enable verbose output");
+	fprintf(stderr, " %-25s %s\n", "-a --adaptive <threshold>",
+			"enable adaptivity to <threshold>% CPU usage");
+	fprintf(stderr, "\n");
+	fprintf(stderr, " %-25s %s\n", "-h --help", "print this help message");
+	fprintf(stderr, " %-25s %s\n", "-v --verbose", "enable verbose output");
 
 	fprintf(stderr, "\n\n");
 	fprintf(stderr, "Environment Variables:\n");
@@ -1488,6 +1488,7 @@ static void ms_usage(char *name) {
 			"Default path is: /dev/shm/ofi/<uid>/<hostname>\n");
 	fprintf(stderr, "       Use headers environment variable if database "
 			"authorization is necessary.\n");
+	fprintf(stderr, "\n");
 }
 
 static int ms_parse_opts(int argc, char** argv, struct ct_mon_sampler *ct) {
@@ -1495,12 +1496,29 @@ static int ms_parse_opts(int argc, char** argv, struct ct_mon_sampler *ct) {
 	unsigned long long_out;
 	double double_out;
 	int op;
-	while ((op = getopt(argc, argv, "hvw:f:o:r:sm:la:")) != -1) {
+	int option_index;
+
+	struct option long_opts[] = {
+		{"help", no_argument, 0, 'h'},
+		{"verbose", no_argument, 0, 'v'},
+		{"watch", required_argument, 0, 'w'},
+		{"format", required_argument, 0, 'f'},
+		{"output", required_argument, 0, 'o'},
+		{"remote", required_argument, 0, 'r'},
+		{"stdout", no_argument, 0, 's'},
+		{"buffer-size", required_argument, 0, 'm'},
+		{"log", no_argument, 0, 'l'},
+		{"adaptive", required_argument, 0, 'a'},
+		{NULL, 0, NULL, 0},
+	};
+
+	while ((op = getopt_long(argc, argv, "hvw:f:o:r:sm:la:", long_opts, &option_index)) != -1) {
 		switch (op) {
 		case '?':
 		case 'h':
+			fprintf(stderr, "Sampler for ofi_hook_monitor provider\n\n");
 			ms_usage(basename(argv[0]));
-			return EXIT_FAILURE;
+			return 1;
 		case 'v':
 			ct->opts.verbose = true;
 			break;
@@ -1565,9 +1583,9 @@ static int ms_parse_opts(int argc, char** argv, struct ct_mon_sampler *ct) {
 	}
 
 	if (optind == argc) {
-		fprintf(stderr, "No target path specified!\n");
+		fprintf(stderr, "No target path specified!\n\n");
 		ms_usage(argv[0]);
-		return 0;
+		return -EINVAL;
 	}
 	ct->opts.target_path = argv[optind];
 
@@ -1701,7 +1719,8 @@ int main(int argc, char **argv) {
 	if (sigaction(SIGINT, &saction, NULL) == -1) goto error_errno;
 
 	ret = ms_parse_opts(argc, argv, &ct);
-	if (ret != 0) goto error;
+	if (ret == 1) return 0;
+	if (ret < 0) goto error;
 
 	sleep_usec = (useconds_t)ct.opts.watch_usec;
 

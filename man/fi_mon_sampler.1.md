@@ -21,16 +21,9 @@ fi_mon_sampler  \- Simple sampler for ofi_hook_monitor provider.
 Extract data from the ofi_hook_monitor provider via communication files.
 `<target>` can either be one communication file or a folder of files. Data is
 exported based on `-f <format>` and either printed to stdout (only for single
-files), or stored per communication file at `-o <outpath>`. The sampler can
-watch the communication files for changes via the option `-w <msec>` for
-repeated sampling.
-
-The name format of the output files is based on the ofi_hook_monitor provider
-and is as follows:
-`<ppid>_<pid>_<sequential id>_<job id>_<provider name>`.
-`ppid` and `pid` are taken from the perspective of the monitored application.
-In a batched environment running SLURM, `job id` is set to the SLURM job ID,
-otherwise it is set to 0.
+files), stored per communication file at `-o <outpath>`, or uploaded to a 
+database pointed at with `-r <url>`. The sampler can watch the communication 
+files for changes via the option `-w <msec>` for repeated sampling.
 
 
 # HOW TO RUN
@@ -48,29 +41,30 @@ The sampler will generate output files in the directory specified at `<output>`,
 
 # OPTIONS
 
-*-w \<msec\>*
+`-w --watch <msec>`
 : Watch files for changes, check every \<msec\> milliseconds.
 
-*-f \<format\>*
+`-f --format <format>`
 : Output format. Currently only supports CSV.
 
-*-o \<outpath\>*
+`-o --output <outpath>`
 : Output file path.
 
-*-s*
+`-s --stdout`
 : Print output to stdout. Only works if `<target>` is a single file.
 
-*-r \<remote URL\>*
+`-r --remote <remote URL>`
 : URL of remote output database. Enables monitoring data pusher. Specified
   database endpoint must accept format specified in `-f`.
 
-*-m \<KiB\>*
+`-m --buffer-size <KiB>`
 : Size of pusher data buffer in KiB.
 
-*-l*
-: Enable performance logging of sampler. See Environment Variables for output options.
+`-l --log`
+: Enable performance logging of sampler. See Environment Variables for output 
+options.
 
-*-v*
+`-v --log`
 : Enable verbose output.
 
 # USAGE EXAMPLES
@@ -88,16 +82,35 @@ fi_mon_sampler -o $HOME -w 1000 -f csv /dev/shm/ofi/$UID/$HOSTNAME
 
 # OUTPUT
 
-Output files will be generated in the folder specified at `-o <output>`.
+Output files will be generated in the folder specified at `-o <output>` or
+uploaded to a database pointed at with `-r <url>`.
+
+## Entries
+
+The sampler reports `count` and `sum` counters per bucket for all monitored 
+libfabric functions. Refer to [`fi_hook`(7)](fi_hook.7.html) for more details.
+In addition, several metadata fields are reported:
+
+- `hostname`: hostname as reported by `gethostname(2)`
+- `job_id`: value of `SLURM_JOB_ID` if present, otherwise 0
+- `{p}pid`: (parent) process ID
+- `uid`: UID of monitored application
+- `provider`: name of monitored provider
+- `provider_id`: ID of provider
+- `child_provider_ids`: comma-separated list of child IDs for aggregating 
+providers such as `lnx` or `rx{d,m}`
+- `context_type`: one of endpoint, domain, completion-queue
+- `context_id`: ID of context 
 
 ## Formats
 
+Currently, CSV and Influx Line Protocol outputs are supported.
+
 ### CSV
-In `-f csv` mode, this will contain a CSV file with data for all monitored
-libfabric functions. For each function, both the `count` and `sum` counters
+In `-f csv` mode, a CSV file with data for all monitored libfabric functions is 
+created. For each function, both the `count` and `sum` counters
 are exported, indicated by the column name suffix `_c` and `_s` respectively.
 In addition, each function is monitored for each data size bucket.
-Refer to [`fi_hook`(7)](fi_hook.7.html) for more details.
 
 Example CSV output, first four columns, first three rows:
 
@@ -106,6 +119,22 @@ mon_recv_0_64_c,mon_recv_0_64_s,mon_recv_64_512_c,mon_recv_64_512_s
 0,0,0,0
 22529,0,0,0
 113664,0,0,0
+```
+
+Metadata is reported in the last columns and in the first row. Example metadata 
+output:
+```
+[...],mon_inject_writedata_4M_UP_s,job_id,hostname,uid,ppid,pid,context_type,context_id,provider,provider_id,child_provider_ids
+[...]0,machine1,1000,200,201,ep,0xdeadbeef1234,tcp,0xdeadbeef5678,-
+````
+
+Note: Metadata is only reported in the first row. Subsequent rows will neither
+contain metadata, nor separating commas in order to reduce file size. Should
+your CSV engine fail to accept this asymmetric file, apply the following sed 
+script to append the omitted commas:
+
+```
+sed '3,$s/$/,,,,,,,,,,/' <file.csv>
 ```
 
 ### Influx
@@ -142,7 +171,8 @@ Should a database require authentication, then you can use the
 : Maximum upload speed in KB/second. (default: unlimited)
 
 *MON_SAMPLER_PUSHER_MAX_WAIT_S*
-: Maximum wait time in seconds for pusher before pushing data to database. (default 5)
+: Maximum wait time in seconds for pusher before pushing data to database. 
+(default 5)
 
 
 # Sampler Performance Logging
