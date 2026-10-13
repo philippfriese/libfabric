@@ -43,6 +43,9 @@
 #define MON_BASEPATH_DEFAULT "/dev/shm/ofi"
 #define MON_FILE_MODE_DEFAULT 0600
 #define MON_DIR_MODE_DEFAULT 01700
+#define MON_PROVIDER_NAME_MAX 32
+
+#define MON_DESCRIPTOR_VERSION 0b1
 
 // Note: keep in-sync with util/mon_sampler.c
 #define MONITOR_APIS_EP(DECL)  \
@@ -129,41 +132,52 @@ struct monitor_data {
 	uint64_t sum[MON_SIZE_MAX];
 };
 
+enum monitor_context_type {
+	MON_CTX_TYPE_EP,
+	MON_CTX_TYPE_CQ,
+	MON_CTX_TYPE_DOM
+};
+
+struct monitor_descriptor {
+	uint32_t version;
+	size_t length;
+	uint64_t job_id;
+	pid_t ppid;
+	pid_t pid;
+	char provider_name[MON_PROVIDER_NAME_MAX];
+	enum monitor_context_type context_type;
+	uintptr_t context_id;
+	uintptr_t provider_id;
+	size_t num_child_providers;
+	uintptr_t *child_provider_ids; // serialised as array in comm-file
+};
+
 struct monitor_mapped_data {
 	struct monitor_data data[MON_DATA_SIZE];
 
 	/* Synchronisation Flag
 	 * bit 0    : data flush request
 	 * bit 1    : termination finished
-	 * bit 2,3,4: reserved
-	 * bit 5    : type dom
-	 * bit 6    : type cq
-	 * bit 7    : type eq
+	 * bit 2-7  : reserved
 	 */
 	_Atomic uint8_t flags;
-	uintptr_t key;
-};
-
-enum monitor_context_type {
-	MON_CTX_TYPE_EP   = 0b10000000,
-	MON_CTX_TYPE_CQ   = 0b01000000,
-	MON_CTX_TYPE_DOM  = 0b00100000,
-	MON_CTX_TYPE_MASK = MON_CTX_TYPE_EP | MON_CTX_TYPE_CQ | MON_CTX_TYPE_DOM,
 };
 
 struct monitor_context {
 	uintptr_t key;
-	enum monitor_context_type context_type;
-
 	size_t api_size;
 
 	// internal counter data
 	struct monitor_data data[MON_DATA_SIZE];
 
+	struct monitor_descriptor descriptor;
+
 	// external counter data, shared via communication file
 	struct monitor_mapped_data* share;
 
-	// name of communication file
+	/* Communication File Layout
+	   0x0000-0x0f30 : struct monitor_mapped_data
+	   0x0f30-end    : struct monitor_descriptor  */
 	char shm_name[PATH_MAX];
 
 	// current number of hooked API calls

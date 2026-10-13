@@ -36,11 +36,17 @@
 #include "hook_prov.h"
 
 #include "hook_monitor.h"
+#include "rxm.h"
+#include "rxd.h"
+#include "lnx.h"
+#include "mrail.h"
 
 #include <stdio.h>
 #include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+
+#include <fcntl.h>
 
 #ifdef __linux__
 #include <linux/magic.h>
@@ -61,8 +67,100 @@ struct monitor_environment mon_env = {
 	.basepath = MON_BASEPATH_DEFAULT,
 };
 
+
 static int
-monitor_context_init(const struct fi_provider *hprov,
+monitor_write_descriptor(int fd, struct monitor_context *mon_ctx) {
+	if (lseek(fd, sizeof(struct monitor_mapped_data), SEEK_SET) == -1)
+		return -1;
+
+	if (write(fd, &mon_ctx->descriptor,
+		sizeof(struct monitor_descriptor) - sizeof(uintptr_t*)) == -1)
+		return -1;
+
+	if (mon_ctx->descriptor.num_child_providers == 1) {
+		if(write(fd, &mon_ctx->descriptor.child_provider_ids,
+			sizeof(uintptr_t)) == -1)
+			return -1;
+	} else if (mon_ctx->descriptor.num_child_providers > 1) {
+		for (int i = 0; i < mon_ctx->descriptor.num_child_providers; i++)
+			if(write(fd, &mon_ctx->descriptor.child_provider_ids[i],
+				sizeof(uintptr_t)) == -1)
+				return -1;
+	}
+	return 0;
+}
+
+static int
+monitor_build_descriptor(const struct monitor_fabric *hfabric,
+	struct monitor_descriptor *descr) {
+	const char* slurm_job_id_str;
+	unsigned int slurm_job_id;
+	char *endptr;
+
+	descr->version = MON_DESCRIPTOR_VERSION;
+
+	slurm_job_id_str = getenv("SLURM_JOB_ID");
+	if (slurm_job_id_str != NULL) {
+		errno = 0;
+		slurm_job_id = strtoul(slurm_job_id_str, &endptr, 0);
+		if (errno == ERANGE || *endptr != '\0' || slurm_job_id_str == endptr)
+			FI_WARN(hfabric->hprov, FI_LOG_FABRIC,
+				"Could not parse SLURM_JOB_ID!\n");
+		else
+			descr->job_id = slurm_job_id;
+	}
+
+	if (!strcmp(hfabric->hprov->name, OFI_UTIL_PREFIX "rxm")) {
+		descr->num_child_providers = 1;
+		descr->child_provider_ids =
+			(uintptr_t*)((struct rxm_fabric *)(hfabric->fabric_hook.hfabric))->msg_fabric;
+	}
+	else if(!strcmp(hfabric->hprov->name, OFI_UTIL_PREFIX "rxd")) {
+		descr->num_child_providers = 1;
+		descr->child_provider_ids =
+			(uintptr_t*)((struct rxd_fabric *)(hfabric->fabric_hook.hfabric))->dg_fabric;
+	}
+	else if(!strcmp(hfabric->hprov->name, OFI_UTIL_PREFIX "mrail")) {
+		struct mrail_fabric *fabric = (struct mrail_fabric *)(hfabric->fabric_hook.hfabric);
+		descr->num_child_providers = fabric->num_fabrics;
+		if (descr->num_child_providers > 1) {
+			descr->child_provider_ids = calloc(descr->num_child_providers,
+				sizeof(uintptr_t));
+			for (int i = 0; i < descr->num_child_providers; i++) {
+				descr->child_provider_ids[i] = (uintptr_t)fabric->fabrics[i];
+			}
+		} else {
+			descr->child_provider_ids = (uintptr_t*)*(fabric->fabrics);
+		}
+	}
+	else if(!strcmp(hfabric->hprov->name, OFI_UTIL_PREFIX "lnx")) {
+		struct lnx_fabric *fabric = (struct lnx_fabric *)(hfabric->fabric_hook.hfabric);
+		descr->num_child_providers = fabric->lf_num_fabs;
+		if (descr->num_child_providers > 1) {
+			descr->child_provider_ids = calloc(descr->num_child_providers,
+				sizeof(uintptr_t));
+			for (int i = 0; i < descr->num_child_providers; i++) {
+				descr->child_provider_ids[i] =
+					(uintptr_t)fabric->lf_core_fabrics[i].cf_fabric;
+			}
+		} else {
+			descr->child_provider_ids =
+				(uintptr_t*)fabric->lf_core_fabrics[0].cf_fabric;
+		}
+	}
+
+	descr->ppid = getppid();
+	descr->pid = getpid();
+	strncpy(descr->provider_name, hfabric->hprov->name, MON_PROVIDER_NAME_MAX-1);
+	descr->provider_id = (uintptr_t)hfabric;
+	descr->length = (sizeof(struct monitor_descriptor) - sizeof(uintptr_t*) +
+		(sizeof(uintptr_t) * (descr->num_child_providers)));
+
+	return 0;
+}
+
+static int
+monitor_context_init(const struct monitor_fabric *hfabric,
 	struct monitor_context *mon_ctx)
 {
 	mode_t old_umask;
@@ -71,11 +169,14 @@ monitor_context_init(const struct fi_provider *hprov,
 	char buffer[PATH_MAX];
 	struct statfs info;
 	bool is_tmpfs;
-	unsigned long job_id;
-	const char* slurm_job_id_str;
-	unsigned int slurm_job_id;
-	char *endptr;
 	int fd;
+
+	const struct fi_provider *hprov = hfabric->hprov;
+
+	if (monitor_build_descriptor(hfabric, &mon_ctx->descriptor) != 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to build descriptor!\n");
+		return -1;
+	}
 
 	errno = 0;
 	old_umask = umask(0);
@@ -137,39 +238,11 @@ monitor_context_init(const struct fi_provider *hprov,
 			outpath);
 	}
 
-	job_id = 0;
-	slurm_job_id_str = getenv("SLURM_JOB_ID");
-	if (slurm_job_id_str != NULL) {
-		errno = 0;
-		slurm_job_id = strtoul(slurm_job_id_str, &endptr, 0);
-		if (errno == ERANGE || *endptr != '\0' || slurm_job_id_str == endptr)
-			FI_WARN(hprov, FI_LOG_FABRIC,
-				"Could not parse SLURM_JOB_ID!\n");
-		else
-			job_id = slurm_job_id;
-	}
-
-	char ctx_type[4];
-	switch (mon_ctx->context_type) {
-	case MON_CTX_TYPE_EP:
-		snprintf(ctx_type, 4, "ep"); break;
-	case MON_CTX_TYPE_CQ:
-		snprintf(ctx_type, 4, "cq"); break;
-	case MON_CTX_TYPE_DOM:
-		snprintf(ctx_type, 4, "dom"); break;
-	default: break;
-	}
-
-	if (snprintf(mon_ctx->shm_name, PATH_MAX, "%s/%u_%u_%s_%lu_%s.XXXXXX",
-		     outpath, getppid(), getpid(),
-		     ctx_type, job_id, hprov->name) < 0) {
+	if (snprintf(mon_ctx->shm_name, PATH_MAX, "%s/%i.XXXXXX",
+		     outpath, getpid()) < 0) {
 		FI_WARN(hprov, FI_LOG_CORE, "Failed so format shm name!\n");
 		return -EOVERFLOW;
 	}
-
-	FI_TRACE(hprov, FI_LOG_FABRIC, "[%s] Using file: %s\n",
-		 hprov->name, mon_ctx->shm_name);
-
 
 	old_umask = umask(0177);
 	fd = mkstemp(mon_ctx->shm_name);
@@ -179,28 +252,32 @@ monitor_context_init(const struct fi_provider *hprov,
 			strerror(errno));
 		return -FI_ENOENT;
 	}
-
 	if (fchmod(fd, mon_env.file_mode) != 0) {
 		FI_WARN(hprov, FI_LOG_CORE, "Failed to chmod %s: %s\n",
 			mon_ctx->shm_name, strerror(errno));
 		goto error;
 	}
 
-	if (ftruncate(fd, sizeof (struct monitor_mapped_data)) != 0) {
+	if (ftruncate(fd, sizeof(struct monitor_mapped_data) +
+		mon_ctx->descriptor.length) != 0) {
 		FI_WARN(hprov, FI_LOG_CORE, "Failed to truncate %s: %s\n",
 			mon_ctx->shm_name, strerror(errno));
 		goto error;
 	}
-	mon_ctx->share = mmap(0, sizeof (struct monitor_mapped_data), PROT_READ|PROT_WRITE,
-			      MAP_SHARED, fd, 0);
+	if (monitor_write_descriptor(fd, mon_ctx) != 0) {
+		FI_WARN(hprov, FI_LOG_CORE, "Failed to write descriptor: %s\n",
+			strerror(errno));
+		goto error;
+	}
+
+	mon_ctx->share = mmap(0, sizeof (struct monitor_mapped_data),
+		PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 	if (mon_ctx->share == MAP_FAILED) {
 		FI_WARN(hprov, FI_LOG_CORE, "Failed to mmap: %s\n",
 			strerror(errno));
 		goto error;
 	}
-
-	mon_ctx->share->flags = mon_ctx->context_type;
-	mon_ctx->share->key = mon_ctx->key;
+	mon_ctx->share->flags = 0b0;
 
 	close(fd);
 	return FI_SUCCESS;
@@ -219,10 +296,11 @@ static inline struct monitor_context *monitor_ctx(struct hook_ep *ep)
 	HASH_FIND_PTR(hfabric->monitor_contexts, &key, mon_ctx);
 	if (mon_ctx == NULL) {
 		mon_ctx = calloc(1, sizeof(struct monitor_context));
-		mon_ctx->key = key;
-		mon_ctx->context_type = MON_CTX_TYPE_EP;
 		mon_ctx->api_size = mon_api_ep_size;
-		monitor_context_init(hfabric->hprov, mon_ctx);
+		mon_ctx->key = key;
+		mon_ctx->descriptor.context_id = key;
+		mon_ctx->descriptor.context_type = MON_CTX_TYPE_EP;
+		monitor_context_init(hfabric, mon_ctx);
 		HASH_ADD_PTR(hfabric->monitor_contexts, key, mon_ctx);
 	}
 
@@ -239,10 +317,11 @@ static inline struct monitor_context *monitor_ctx_cq(struct hook_cq *cq)
 	HASH_FIND_PTR(hfabric->monitor_contexts, &key, mon_ctx);
 	if (mon_ctx == NULL) {
 		mon_ctx = calloc(1, sizeof(struct monitor_context));
-		mon_ctx->key = key;
-		mon_ctx->context_type = MON_CTX_TYPE_CQ;
 		mon_ctx->api_size = mon_api_cq_size;
-		monitor_context_init(hfabric->hprov, mon_ctx);
+		mon_ctx->key = key;
+		mon_ctx->descriptor.context_id = key;
+		mon_ctx->descriptor.context_type = MON_CTX_TYPE_CQ;
+		monitor_context_init(hfabric, mon_ctx);
 		HASH_ADD_PTR(hfabric->monitor_contexts, key, mon_ctx);
 	}
 
@@ -259,10 +338,11 @@ static inline struct monitor_context *monitor_ctx_domain(struct hook_domain *dom
 	HASH_FIND_PTR(hfabric->monitor_contexts, &key, mon_ctx);
 	if (mon_ctx == NULL) {
 		mon_ctx = calloc(1, sizeof(struct monitor_context));
-		mon_ctx->key = key;
-		mon_ctx->context_type = MON_CTX_TYPE_DOM;
 		mon_ctx->api_size = mon_api_dom_size;
-		monitor_context_init(hfabric->hprov, mon_ctx);
+		mon_ctx->key = key;
+		mon_ctx->descriptor.context_id = key;
+		mon_ctx->descriptor.context_type = MON_CTX_TYPE_DOM;
+		monitor_context_init(hfabric, mon_ctx);
 		HASH_ADD_PTR(hfabric->monitor_contexts, key, mon_ctx);
 	}
 
@@ -1087,16 +1167,21 @@ monitor_context_close(const struct fi_provider *hprov, struct monitor_context *m
 		if ((ret = unlink(mon_ctx->shm_name)) != 0) {
 			FI_WARN(hprov, FI_LOG_CORE, "Failed to unlink! (%s)\n",
 				strerror(errno));
-			return ret;
+			goto cleanup;
 		}
 	}
 
 	if ((ret = munmap(mon_ctx->share, sizeof (struct monitor_mapped_data))) != 0) {
 		FI_WARN(hprov, FI_LOG_CORE, "Failed to munmap! (%s)\n", strerror(errno));
-		return ret;
+		goto cleanup;
 	}
 
-	return FI_SUCCESS;
+	ret = FI_SUCCESS;
+
+cleanup:
+	if(mon_ctx->descriptor.num_child_providers > 1)
+		free(mon_ctx->descriptor.child_provider_ids);
+	return ret;
 }
 
 static int hook_monitor_close(struct fid *fid)
@@ -1111,9 +1196,9 @@ static int hook_monitor_close(struct fid *fid)
 		HASH_DEL(hfabric->monitor_contexts, mon_ctx);
 		free(mon_ctx);
 	}
-
 	FI_TRACE(hfabric->hprov, FI_LOG_CORE, "[%s] Closing monitor hook\n",
 		hfabric->hprov->name);
+
 	hook_close(fid);
 	return FI_SUCCESS;
 }

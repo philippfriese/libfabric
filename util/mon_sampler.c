@@ -89,8 +89,6 @@
 #define INOFITY_ELEM_PER_BUF 32
 #define INOFITY_BUF_SIZE (INOFITY_ELEM_PER_BUF*(sizeof(struct inotify_event) + NAME_MAX + 1))
 
-#define PROVIDER_NAME_LEN 32
-
 enum ms_formats {
 	MS_CSV=0,
 	MS_INFLUX=1
@@ -117,12 +115,9 @@ struct file_entry {
 	FILE *output;
 	char hostname[HOST_NAME_MAX+1];
 	int uid;
-	int ppid;
-	int pid;
-	unsigned long job_id;
-	char provider_name[PROVIDER_NAME_LEN];
-	char context_type[4];
-	uintptr_t context_id;
+	struct monitor_descriptor descriptor;
+	char context_type_name[4];
+	char *child_provider_ids_str;
 	bool is_mapped;
 	bool finalize;
 	bool header_written;
@@ -370,6 +365,7 @@ static void* pusher_run(void* arg /* struct ct_pusher* */) {
 	return NULL;
 error:
 	fprintf(stderr, "Error pushing data: %s\n", strerror(-ret));
+	running_pusher = false;
 	return NULL;
 }
 
@@ -433,6 +429,7 @@ static int ms_serialize_influx(struct ct_mon_sampler *ct, struct file_entry *fil
 	struct timespec spec;
 	int bytes_written = 0;
 	uint64_t now;
+
 	clock_gettime(CLOCK_REALTIME, &spec);
 	now = (uint64_t) spec.tv_sec * 1000000000L + (uint64_t) spec.tv_nsec;
 	for(int i = 0; i < file->num_functions; i++) {
@@ -446,15 +443,24 @@ static int ms_serialize_influx(struct ct_mon_sampler *ct, struct file_entry *fil
 					"job_id=%" PRIu64 ",hostname=%s,uid=%i,"
 					"ppid=%i,pid=%i,provider=%s,"
 					"context_type=%s,context_id=%p,"
+					"provider_id=%p,"
+					"child_provider_ids=%s,"
 					"function=%s,bucket=%s"
 					" count=%" PRIu64 ",sum=%" PRIu64
 					" %" PRIu64 "\n",
-					file->job_id, file->hostname, file->uid,
-					file->ppid, file->pid, file->provider_name,
-					file->context_type, (void*)file->context_id,
+					file->descriptor.job_id, file->hostname,
+					file->uid,
+					file->descriptor.ppid, file->descriptor.pid,
+					file->descriptor.provider_name,
+					file->context_type_name,
+					(void*)file->descriptor.context_id,
+					(void*)file->descriptor.provider_id,
+					file->child_provider_ids_str != NULL ?
+					file->child_provider_ids_str : "-",
 					file->function_names[i], mon_buckets[j],
 					ct->data[i].count[j], ct->data[i].sum[j],
 					now);
+
 			if (bytes_written >= buffer_size - *offset)
 				return -EMSGSIZE;
 			*offset += bytes_written;
@@ -591,6 +597,9 @@ static int ms_remove_file_entry(struct ct_mon_sampler *ct, struct dlist_entry *e
 		if (remove(file->in_path) == -1)
 			goto error;
 
+	if (file->descriptor.num_child_providers > 0) {
+		free(file->child_provider_ids_str);
+	}
 	dlist_remove(entry);
 	free(file);
 	return 0;
@@ -604,75 +613,94 @@ error:
 
 /* file entry management functions */
 static int ms_create_file_entry(struct ct_mon_sampler *ct, struct file_entry *file) {
-	char file_path[PATH_MAX], file_name[PATH_MAX];
-	char *token, *remainder, *endptr;
+	char file_path[PATH_MAX];
+	char *remainder;
 	char format[16] = "";
 	int fd;
+	struct stat st;
+
 
 	if (file->is_mapped)
 		return 0;
-
 	fd = open(file->in_path, O_RDWR);
 	if (fd < 0) {
 		fprintf(stderr, "Could not open %s: %s\n", file->in_path, strerror(errno));
 		return -ENOENT;
 	}
+
 	file->share = mmap(0, sizeof (struct monitor_mapped_data),
 			   PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
 	if (file->share == MAP_FAILED) {
 		fprintf(stderr, "Could not mmap %s: %s\n", file->in_path, strerror(errno));
-		return -EINVAL;
+		goto cleanup_fd;
 	}
 	file->is_mapped = true;
 
-	strncpy(file_name, file->in_path, PATH_MAX);
-
-	remainder = basename(file_name);
-	token = strtok_r(remainder, "_", &remainder);
-	file->ppid = (int)strtol(token, &endptr, 10);
-	if (*endptr) goto error_strtol;
-
-	token = strtok_r(remainder, "_", &remainder);
-	file->pid = (int)strtol(token, &endptr, 10);
-	if (*endptr) goto error_strtol;
-	token = strtok_r(remainder, "_", &remainder);
-	strncpy(file->context_type, token, 3);
-
-	token = strtok_r(remainder, "_", &remainder);
-	file->job_id = strtol(token, &endptr, 10);
-	if (*endptr) goto error_strtol;
-
-	token = strtok_r(remainder, ".", &remainder);
-	strncpy(file->provider_name, token, PROVIDER_NAME_LEN-1);
+	if (lseek(fd, sizeof(struct monitor_mapped_data), SEEK_SET) == -1) {
+		fprintf(stderr, "Could not seek %s: %s\n", file->in_path, strerror(errno));
+		goto cleanup_fd;
+	}
+	if (read(fd, &file->descriptor, sizeof(struct monitor_descriptor)) == -1) {
+		fprintf(stderr, "Could not read descriptor: %s\n", strerror(errno));
+		goto cleanup_fd;
+	}
+	if (file->descriptor.num_child_providers > 0) {
+		size_t str_size = sizeof(char) *
+		(18*file->descriptor.num_child_providers
+			+ file->descriptor.num_child_providers);
+		file->child_provider_ids_str = calloc(1, str_size);
+		if (!file->child_provider_ids_str) {
+			fprintf(stderr, "Could not allocate memory! %s\n",
+				strerror(errno));
+			goto cleanup_fd;
+		}
+		if (lseek(fd, -sizeof(uintptr_t*), SEEK_CUR) == -1) {
+			fprintf(stderr, "Could not seek %s: %s\n", file->in_path,
+				strerror(errno));
+			goto cleanup_fd;
+		}
+		for (int i = 0; i < file->descriptor.num_child_providers; i++) {
+			uintptr_t provider_id;
+			if(read(fd, &provider_id, sizeof(uintptr_t)) == -1) {
+				fprintf(stderr, "Could not read descriptor: %s\n",
+					strerror(errno));
+				goto cleanup_fd;
+			}
+			snprintf(file->child_provider_ids_str, str_size,
+				i == 0 ? "%p" : ";%p", (void*)provider_id);
+		}
+	}
+	if (fstat(fd, &st) == -1) {
+		fprintf(stderr, "Could not stat %s: %s\n", file->in_path,
+			strerror(errno));
+		goto cleanup_fd;
+	}
+	close(fd);
 
 	strncpy(file_path, file->in_path, PATH_MAX);
 	remainder = basename(dirname(file_path));
 	strncpy(file->hostname, remainder, HOST_NAME_MAX);
+	file->uid = st.st_uid;
 
-	strncpy(file_path, file->in_path, PATH_MAX);
-	remainder = basename(dirname(dirname(file_path)));
-	token = strtok_r(remainder, "_", &remainder);
-	file->uid = (int64_t)strtol(token, &endptr, 10);
-	if (*endptr) goto error_strtol;
-
-	file->context_id = file->share->key;
-
-	switch (file->share->flags & MON_CTX_TYPE_MASK) {
+	switch (file->descriptor.context_type) {
 	case MON_CTX_TYPE_EP:
 		file->num_functions = mon_api_ep_size;
 		file->function_names = mon_functions_ep;
+		strncpy(file->context_type_name, "ep", 4);
 		break;
 	case MON_CTX_TYPE_CQ:
 		file->num_functions = mon_api_cq_size;
 		file->function_names = mon_functions_cq;
+		strncpy(file->context_type_name, "cq", 4);
 		break;
 	case MON_CTX_TYPE_DOM:
 		file->num_functions = mon_api_dom_size;
 		file->function_names = mon_functions_dom;
+		strncpy(file->context_type_name, "dom", 4);
 		break;
 	default:
-		fprintf(stderr, "Unknown source '%s'\n", file->context_type);
+		fprintf(stderr, "Unknown context type: %i\n",
+			file->descriptor.context_type);
 		return -EINVAL;
 	}
 
@@ -720,8 +748,8 @@ static int ms_create_file_entry(struct ct_mon_sampler *ct, struct file_entry *fi
 
 	return 0;
 
-error_strtol:
-	fprintf(stderr, "Warning: Could not parse input file %s: %s\n", file->in_path, strerror(errno));
+cleanup_fd:
+	close(fd);
 	return -EINVAL;
 }
 
