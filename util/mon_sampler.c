@@ -376,25 +376,54 @@ error:
 static int ms_serialize_csv(struct ct_mon_sampler *ct, struct file_entry *file,
 	char *buffer, size_t *offset, size_t buffer_size) {
 	int bytes_written = 0;
+	struct timespec spec;
+	uint64_t now;
 	if (!file->header_written) {
 		for (int i = 0; i < file->num_functions; i++) {
 			for (int j = 0; j < MON_SIZE_MAX; j++) {
-				bytes_written = snprintf(buffer + *offset, buffer_size - *offset,
-					"%s_%s_c,%s_%s_s",
+				bytes_written = snprintf(buffer + *offset, 
+					buffer_size - *offset,
+					"%s_%s_c,%s_%s_s,",
 					file->function_names[i], mon_buckets[j],
 					file->function_names[i], mon_buckets[j]);
 				if (bytes_written >= buffer_size - *offset)
 					return -EMSGSIZE;
 				*offset += bytes_written;
-				if (!(i + 1 == file->num_functions && j + 1 == MON_SIZE_MAX)){
-					bytes_written = snprintf(buffer + *offset, buffer_size - *offset, ",");
-					if (bytes_written >= buffer_size - *offset)
-						return -EMSGSIZE;
-					*offset += bytes_written;
-				}
 			}
 		}
-		bytes_written += snprintf(buffer + *offset, buffer_size - *offset, "\n");
+		bytes_written = snprintf(buffer + *offset, buffer_size - *offset,
+					"timestamp,job_id,hostname,uid,"
+					"ppid,pid,"
+					"context_type,context_id,"
+					"provider,provider_id,"
+					"child_provider_ids\n");
+		if (bytes_written >= buffer_size - *offset)
+			return -EMSGSIZE;
+		*offset += bytes_written;
+
+		for (int i = 0; i < file->num_functions; i++) {
+			for (int j = 0; j < MON_SIZE_MAX; j++) {
+				bytes_written = snprintf(buffer + *offset, 
+					buffer_size - *offset,
+					"0,0,");
+				if (bytes_written >= buffer_size - *offset)
+					return -EMSGSIZE;
+				*offset += bytes_written;
+			}
+		}
+		clock_gettime(CLOCK_REALTIME, &spec);
+		now = (uint64_t) spec.tv_sec * 1000000000L + (uint64_t) spec.tv_nsec;
+		bytes_written = snprintf(buffer + *offset, buffer_size - *offset,
+					"%" PRIu64 ",%" PRIu64 ",%s,%i,%i,%i,%s,%p,%s,%p,%s\n",
+					now, file->descriptor.job_id, file->hostname,
+					file->uid,
+					file->descriptor.ppid, file->descriptor.pid,
+					file->context_type_name,
+					(void*)file->descriptor.context_id,
+					file->descriptor.provider_name,
+					(void*)file->descriptor.provider_id,
+					file->child_provider_ids_str != NULL ?
+					file->child_provider_ids_str : "-");
 		if (bytes_written >= buffer_size - *offset)
 			return -EMSGSIZE;
 		*offset += bytes_written;
@@ -441,9 +470,9 @@ static int ms_serialize_influx(struct ct_mon_sampler *ct, struct file_entry *fil
 					buffer_size - *offset,
 					"ofi_hook_monitor,"
 					"job_id=%" PRIu64 ",hostname=%s,uid=%i,"
-					"ppid=%i,pid=%i,provider=%s,"
+					"ppid=%i,pid=%i,"
 					"context_type=%s,context_id=%p,"
-					"provider_id=%p,"
+					"provider=%s,provider_id=%p,"
 					"child_provider_ids=%s,"
 					"function=%s,bucket=%s"
 					" count=%" PRIu64 ",sum=%" PRIu64
@@ -451,9 +480,9 @@ static int ms_serialize_influx(struct ct_mon_sampler *ct, struct file_entry *fil
 					file->descriptor.job_id, file->hostname,
 					file->uid,
 					file->descriptor.ppid, file->descriptor.pid,
-					file->descriptor.provider_name,
 					file->context_type_name,
 					(void*)file->descriptor.context_id,
+					file->descriptor.provider_name,
 					(void*)file->descriptor.provider_id,
 					file->child_provider_ids_str != NULL ?
 					file->child_provider_ids_str : "-",
