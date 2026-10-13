@@ -92,6 +92,8 @@
 #define ADAPTIVE_NUM_SAMPLES 64
 #define ADAPTIVE_NUM_SAMPLES_EDGE 16
 #define ADAPTIVE_PERCENTILE 0.92
+#define ADAPTIVE_PUSHER_I_MULT 0.5
+#define ADAPTIVE_PUSHER_I_ADD_KB 1024
 
 enum ms_formats {
 	MS_CSV=0,
@@ -493,6 +495,7 @@ static int pusher_post_data(struct ct_pusher *pusher) {
 	if (pusher->f_log_pusher) {
 		const double run_ms = timespec_to_ms(timespec_diff(&t2, &t1));
 		const double cpu_ms = timespec_to_ms(timespec_diff(&cpu_t2, &cpu_t1));
+		const double cpu_perc = cpu_ms / run_ms;
 		// const double offset = run_ms - pusher->buffer_size*pusher->speed_limit_bs;
 
 		if (clock_gettime(CLOCK_REALTIME, &tnow) == -1) goto error;
@@ -503,9 +506,14 @@ static int pusher_post_data(struct ct_pusher *pusher) {
 			cpu_ms, pusher->speed_limit_bs);
 
 		if (pusher->cpu_adapt_target != 0) {
-			const double desired_upload_ms = cpu_ms / pusher->cpu_adapt_target;
-			pusher->speed_limit_bs *= run_ms / desired_upload_ms;
-
+			if (cpu_perc > pusher->cpu_adapt_target) {
+				pusher->speed_limit_bs *= ADAPTIVE_PUSHER_I_MULT;
+				if (pusher->speed_limit_bs == 0)
+					pusher->speed_limit_bs = ADAPTIVE_PUSHER_I_ADD_KB*1024;
+			} else {
+				if (pusher->speed_limit_bs < LONG_MAX - ADAPTIVE_PUSHER_I_ADD_KB*1024)
+					pusher->speed_limit_bs += ADAPTIVE_PUSHER_I_ADD_KB*1024;
+			}
 			code = curl_easy_setopt(pusher->curl_handle,
 				CURLOPT_MAX_SEND_SPEED_LARGE,
 				pusher->speed_limit_bs);
@@ -1310,7 +1318,6 @@ static int ms_init_pusher(struct ct_mon_sampler *ct) {
 	ret = pthread_setname_np(ct->pusher_thread, "pusher");
 	if (ret != 0) return ret;
 
-	ct->pusher->speed_limit_bs = ct->opts.buffer_size;
 	ret = pthread_getcpuclockid(ct->pusher_thread, &ct->pusher->cpu_time.clock_id);
 	if (ret != 0) return ret;
 
@@ -1788,7 +1795,7 @@ int main(int argc, char **argv) {
 				ct.serialized_elements,
 				ct.serialized_bytes,
 				ct.procs_with_data,
-				sleep_usec + (useconds_t)(run_ms*1000),
+				sleep_usec,
 				ct.edge_cooldown == ADAPTIVE_NUM_SAMPLES_EDGE/2);
 		}
 		
