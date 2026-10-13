@@ -176,7 +176,9 @@ util_fi_pingpong_LDADD = $(linkback)
 if HAVE_MONITOR
 util_fi_mon_sampler_SOURCES = \
 	util/mon_sampler.c
-util_fi_mon_sampler_LDADD = $(linkback)
+util_fi_mon_sampler_LDADD = $(linkback) $(fi_mon_sampler_LIBS) -lm
+util_fi_mon_sampler_CFLAGS = $(fi_mon_sampler_CFLAGS) $(AM_CFLAGS)
+util_fi_mon_sampler_LDFLAGS = $(fi_mon_sampler_LDFLAGS) $(AM_LDFLAGS)
 endif
 
 nodist_src_libfabric_la_SOURCES =
